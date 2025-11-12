@@ -1,0 +1,4 @@
+re_arc/tasks/*
+.DS_Store
+*.json
+!re_arc/metadata.json
