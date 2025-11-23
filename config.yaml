@@ -3,25 +3,25 @@ model:
   vocab_size: 400
   d_model: 512
   n_head: 8
-  num_recursions: 8
+  num_recursions: 16
   dropout: 0.1
 
 # Training Schedule
 training:
-  epochs: 100
-  batch_size: 64
+  epochs: 1000
+  batch_size: 128
   lr: 1.0e-4
   device: "auto"
 
 # Validation & Execution
 validation:
-  interval_epochs: 5      # Run validation every N epochs
-  num_examples: 32        # Total examples to generate, execute & score for validation
+  interval_epochs: 25      # Run validation every N epochs
+  num_examples: 400        # Total examples to generate, execute & score for validation
 
 # Checkpointing
 checkpoint:
   save_dir: "checkpoints"
-  save_every_n_epochs: 10
+  save_every_n_epochs: 100
   keep_best: true
 
 # Logging
