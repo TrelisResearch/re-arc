@@ -15,7 +15,7 @@ training:
 
 # Validation & Execution
 validation:
-  interval_epochs: 1      # Run validation every N epochs
+  interval_epochs: 50      # Run validation every N epochs
   num_examples: 400        # Total examples to generate, execute & score for validation
 
 # Checkpointing

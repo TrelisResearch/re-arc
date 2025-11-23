@@ -237,6 +237,7 @@ def run_validation(model, dataloader, tokenizer, device, num_examples, global_st
         src_batch_slice = src_batch[:batch_size_actual]
         generated_codes = run_generation_batch(model, src_batch_slice, tokenizer, device)
 
+        batch_syn, batch_run, batch_corr = 0, 0, 0
         for j in range(batch_size_actual):
             try:
                 src_cpu = src_batch[j].cpu().tolist()
@@ -256,19 +257,24 @@ def run_validation(model, dataloader, tokenizer, device, num_examples, global_st
                     code = generated_codes[j]
                     is_syn, is_run, is_corr = execute_and_score(code, input_grid, target_grid)
 
-                    if is_syn: syntax_valid_count += 1
-                    if is_run: runtime_success_count += 1
-                    if is_corr: correct_count += 1
+                    if is_syn:
+                        syntax_valid_count += 1
+                        batch_syn += 1
+                    if is_run:
+                        runtime_success_count += 1
+                        batch_run += 1
+                    if is_corr:
+                        correct_count += 1
+                        batch_corr += 1
                     processed_count += 1
-
-                    if processed_count <= 2:
-                        print(f"Ex {processed_count}: Syn={is_syn}, Run={is_run}, Corr={is_corr}")
 
                 except ValueError:
                     continue
             except Exception as e:
                 # print(f"Val Error (execution): {e}") # Too verbose
                 continue
+
+        print(f"Batch {batch_idx+1}: {processed_count}/{num_examples} | Syn: {batch_syn}/{batch_size_actual} | Run: {batch_run}/{batch_size_actual} | Corr: {batch_corr}/{batch_size_actual}")
 
     # Final Stats
     num_batches_for_std_metrics = batch_idx + 1
