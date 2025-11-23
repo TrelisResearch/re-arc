@@ -359,7 +359,8 @@ def train():
     if args.resume:
         print(f"Loading checkpoint from {args.resume}")
         checkpoint = torch.load(args.resume, map_location=DEVICE)
-        if isinstance(checkpoint, dict):
+        if 'model_state_dict' in checkpoint:
+            # New format checkpoint
             model.load_state_dict(checkpoint['model_state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             start_epoch = checkpoint.get('epoch', 0)
