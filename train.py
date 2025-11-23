@@ -133,10 +133,13 @@ def calculate_metrics(logits, targets, pad_idx):
 def run_generation(model, src, tokenizer, device, max_len):
     model.eval()
     with torch.no_grad():
+        # Compute source padding mask
+        src_padding_mask = (src == tokenizer.pad_token_id)
+
         src_emb = model.pos_encoder(model.embedding(src) * math.sqrt(model.d_model))
-        memory = model.encoder_input_layer(src_emb)
+        memory = model.encoder_input_layer(src_emb, src_key_padding_mask=src_padding_mask)
         for _ in range(model.num_recursions):
-            memory = model.recursive_layer(memory)
+            memory = model.recursive_layer(memory, src_key_padding_mask=src_padding_mask)
 
         curr_tgt = torch.tensor([[tokenizer.bos_token_id]], device=device)
         pred_tokens = []
@@ -144,7 +147,7 @@ def run_generation(model, src, tokenizer, device, max_len):
         for _ in range(max_len):
             tgt_emb = model.pos_encoder(model.embedding(curr_tgt) * math.sqrt(model.d_model))
             tgt_mask = generate_square_subsequent_mask(curr_tgt.size(1)).to(device)
-            output = model.decoder(tgt_emb, memory, tgt_mask=tgt_mask)
+            output = model.decoder(tgt_emb, memory, tgt_mask=tgt_mask, memory_key_padding_mask=src_padding_mask)
             next_token = torch.argmax(model.fc_out(output[:, -1, :]), dim=-1).item()
 
             if next_token == tokenizer.eos_token_id:
@@ -163,10 +166,13 @@ def run_generation_batch(model, src_batch, tokenizer, device, max_len):
     batch_size = src_batch.size(0)
 
     with torch.no_grad():
+        # Compute source padding mask
+        src_padding_mask = (src_batch == tokenizer.pad_token_id)
+
         src_emb = model.pos_encoder(model.embedding(src_batch) * math.sqrt(model.d_model))
-        memory = model.encoder_input_layer(src_emb)
+        memory = model.encoder_input_layer(src_emb, src_key_padding_mask=src_padding_mask)
         for _ in range(model.num_recursions):
-            memory = model.recursive_layer(memory)
+            memory = model.recursive_layer(memory, src_key_padding_mask=src_padding_mask)
 
         curr_tgt = torch.full((batch_size, 1), tokenizer.bos_token_id, device=device)
         finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
@@ -174,7 +180,7 @@ def run_generation_batch(model, src_batch, tokenizer, device, max_len):
         for _ in range(max_len):
             tgt_emb = model.pos_encoder(model.embedding(curr_tgt) * math.sqrt(model.d_model))
             tgt_mask = generate_square_subsequent_mask(curr_tgt.size(1)).to(device)
-            output = model.decoder(tgt_emb, memory, tgt_mask=tgt_mask)
+            output = model.decoder(tgt_emb, memory, tgt_mask=tgt_mask, memory_key_padding_mask=src_padding_mask)
             next_tokens = torch.argmax(model.fc_out(output[:, -1, :]), dim=-1)
 
             finished |= (next_tokens == tokenizer.eos_token_id)
