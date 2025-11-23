@@ -26,10 +26,10 @@ class RecursiveDSLTransformer(nn.Module):
         
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.pos_encoder = PositionalEncoding(d_model, dropout)
-        
+
         self.encoder_input_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=n_head, dim_feedforward=2048, dropout=dropout, batch_first=True)
         self.recursive_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=n_head, dim_feedforward=2048, dropout=dropout, batch_first=True)
-        
+
         self.decoder_layer = nn.TransformerDecoderLayer(d_model=d_model, nhead=n_head, dim_feedforward=2048, dropout=dropout, batch_first=True)
         self.decoder = nn.TransformerDecoder(self.decoder_layer, num_layers=2) 
         
@@ -298,7 +298,9 @@ def run_validation(model, dataloader, tokenizer, device, num_examples, global_st
                         # Check for newlines in generated code
                         newline_check = code.count('\n')
                         print(f"Generated code length: {len(code)}, Newlines: {newline_check}")
-                        print(code[:200] + "..." if len(code) > 200 else code)
+                        print("=== FULL GENERATED CODE ===")
+                        print(code)
+                        print("=== END CODE ===")
                         print(f"Syn={is_syn}, Run={is_run}, Corr={is_corr}\n")
 
                 except ValueError:

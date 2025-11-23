@@ -12,6 +12,8 @@
     - **% Solved**: Produces exact target grid.
 
 ## TODO
+- [ ] **Review code overall**
+- [ ] **Review architecture**
 - [ ] **Guided Decoding**: Constrain generation.
 - [ ] **Static Analysis Optimization**: Filter programs with `ast.parse` and symbol checks before expensive execution.
 - [ ] Do predicted programs include upper and lower bound parameters? if so, that could be powerful for data augmentation.
