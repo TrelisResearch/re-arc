@@ -389,16 +389,16 @@ def train():
 
                 # Expand embedding layer
                 old_emb = state_dict['embedding.weight']
-                new_emb = torch.randn(new_vocab_size - old_vocab_size, old_emb.size(1)) * 0.02
+                new_emb = torch.randn(new_vocab_size - old_vocab_size, old_emb.size(1), device=old_emb.device) * 0.02
                 state_dict['embedding.weight'] = torch.cat([old_emb, new_emb], dim=0)
 
                 # Expand fc_out layer
                 old_fc_weight = state_dict['fc_out.weight']
-                new_fc_weight = torch.randn(new_vocab_size - old_vocab_size, old_fc_weight.size(1)) * 0.02
+                new_fc_weight = torch.randn(new_vocab_size - old_vocab_size, old_fc_weight.size(1), device=old_fc_weight.device) * 0.02
                 state_dict['fc_out.weight'] = torch.cat([old_fc_weight, new_fc_weight], dim=0)
 
                 old_fc_bias = state_dict['fc_out.bias']
-                new_fc_bias = torch.zeros(new_vocab_size - old_vocab_size)
+                new_fc_bias = torch.zeros(new_vocab_size - old_vocab_size, device=old_fc_bias.device)
                 state_dict['fc_out.bias'] = torch.cat([old_fc_bias, new_fc_bias], dim=0)
 
         model.load_state_dict(state_dict)
