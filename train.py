@@ -373,15 +373,20 @@ def train():
     ).to(DEVICE)
 
     # Compile model for speedup (PyTorch 2.0+)
-    if hasattr(torch, 'compile'):
-        print("Compiling model with torch.compile...")
-        model = torch.compile(model)
+    if hasattr(torch, 'compile') and cfg.get('training', {}).get('use_torch_compile', False):
+        try:
+            print("Compiling model with torch.compile...")
+            model = torch.compile(model, dynamic=True)
+            print("Model compiled successfully!")
+        except Exception as e:
+            print(f"torch.compile failed: {e}")
+            print("Continuing without compilation...")
 
     optimizer = optim.Adam(model.parameters(), lr=float(cfg['training']['lr']))
     criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
 
     # Mixed precision training
-    scaler = torch.cuda.amp.GradScaler() if DEVICE.type == 'cuda' else None
+    scaler = torch.amp.GradScaler('cuda') if DEVICE.type == 'cuda' else None
     use_amp = DEVICE.type == 'cuda'
 
     print(f"Model Parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
@@ -429,7 +434,7 @@ def train():
 
             # Mixed precision forward pass
             if use_amp:
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast('cuda'):
                     logits = model(src, tgt_input, tgt_mask=tgt_mask, src_padding_mask=src_padding_mask, tgt_padding_mask=tgt_padding_mask)
                     loss = criterion(logits.reshape(-1, logits.shape[-1]), tgt_output.reshape(-1))
                 scaler.scale(loss).backward()
