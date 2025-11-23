@@ -268,6 +268,11 @@ def run_validation(model, dataloader, tokenizer, device, num_examples, global_st
                         batch_corr += 1
                     processed_count += 1
 
+                    if processed_count <= 3:
+                        print(f"\n--- Generated Code Sample {processed_count} ---")
+                        print(code)
+                        print(f"Syn={is_syn}, Run={is_run}, Corr={is_corr}\n")
+
                 except ValueError:
                     continue
             except Exception as e:
@@ -304,6 +309,7 @@ def train():
     parser.add_argument('--config', type=str, default='config.yaml', help='Path to config file')
     parser.add_argument('--use_wandb', action='store_true', help='Override config to enable wandb')
     parser.add_argument('--limit_batches', type=int, default=None, help='For testing: limit training batches per epoch')
+    parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume from')
     args = parser.parse_args()
 
     with open(args.config, 'r') as f:
@@ -340,16 +346,33 @@ def train():
     
     optimizer = optim.Adam(model.parameters(), lr=float(cfg['training']['lr']))
     criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
-    
+
     print(f"Model Parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
-    
+
     save_dir = cfg['checkpoint']['save_dir']
     os.makedirs(save_dir, exist_ok=True)
     best_val_correct = 0.0
     global_step = 0 # To track total batches for WandB
+    start_epoch = 0
+
+    # Resume from checkpoint if specified
+    if args.resume:
+        print(f"Loading checkpoint from {args.resume}")
+        checkpoint = torch.load(args.resume, map_location=DEVICE)
+        if isinstance(checkpoint, dict):
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            start_epoch = checkpoint.get('epoch', 0)
+            global_step = checkpoint.get('global_step', 0)
+            best_val_correct = checkpoint.get('best_val_correct', 0.0)
+            print(f"Resumed from epoch {start_epoch}, global_step {global_step}")
+        else:
+            # Legacy checkpoint (just model weights)
+            model.load_state_dict(checkpoint)
+            print(f"Loaded model weights only")
 
     model.train()
-    for epoch in range(cfg['training']['epochs']):
+    for epoch in range(start_epoch, cfg['training']['epochs']):
         total_loss = 0
         
         for batch_idx, (src, tgt) in enumerate(dataloader):
@@ -399,11 +422,25 @@ def train():
             
             if cfg['checkpoint']['keep_best'] and corr_rate >= best_val_correct:
                 best_val_correct = corr_rate
-                torch.save(model.state_dict(), os.path.join(save_dir, "model_best.pt"))
+                checkpoint = {
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'epoch': epoch + 1,
+                    'global_step': global_step,
+                    'best_val_correct': best_val_correct
+                }
+                torch.save(checkpoint, os.path.join(save_dir, "model_best.pt"))
                 print("Saved Best Model!")
 
         if (epoch + 1) % cfg['checkpoint']['save_every_n_epochs'] == 0:
-            torch.save(model.state_dict(), os.path.join(save_dir, f"model_epoch_{epoch+1}.pt"))
+            checkpoint = {
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'epoch': epoch + 1,
+                'global_step': global_step,
+                'best_val_correct': best_val_correct
+            }
+            torch.save(checkpoint, os.path.join(save_dir, f"model_epoch_{epoch+1}.pt"))
 
 if __name__ == "__main__":
     train()
