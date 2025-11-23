@@ -10,7 +10,7 @@ class DSLTokenizer:
         
     def build_vocab(self):
         # 1. Special Tokens
-        special_tokens = ['[PAD]', '[BOS]', '[EOS]', '[SEP]', '[ROW]']
+        special_tokens = ['[PAD]', '[BOS]', '[EOS]', '[SEP]', '[ROW]', '[NEWLINE]']
         
         # 2. Primitives from DSL
         dsl_tokens = sorted([name for name in dir(dsl) if not name.startswith('__')])
@@ -56,6 +56,7 @@ class DSLTokenizer:
         self.eos_token_id = self.token_to_id['[EOS]']
         self.sep_token_id = self.token_to_id['[SEP]']
         self.row_token_id = self.token_to_id['[ROW]']
+        self.newline_token_id = self.token_to_id['[NEWLINE]']
         
     def encode_grid(self, grid):
         """
@@ -78,34 +79,52 @@ class DSLTokenizer:
         """
         Tokenizes a Python code string (the body of a verifier).
         """
-        # Simple regex tokenizer matching the vocab building strategy
-        token_pattern = re.compile(r'[a-zA-Z_][a-zA-Z0-9_]*|\d+|[(),=]')
+        # Tokenizer that captures newlines
+        token_pattern = re.compile(r'[a-zA-Z_][a-zA-Z0-9_]*|\d+|[(),=]|\n')
         raw_tokens = token_pattern.findall(code_string)
-        
-        # Filter identifiers that might not be in vocab (shouldn't happen if vocab is complete)
-        # and map to IDs
+
+        # Map to IDs, converting \n to [NEWLINE] token
         ids = []
         for t in raw_tokens:
-            if t in self.token_to_id:
+            if t == '\n':
+                ids.append(self.newline_token_id)
+            elif t in self.token_to_id:
                 ids.append(self.token_to_id[t])
             else:
-                # If unknown token (rare), we could skip or use UNK. 
+                # If unknown token (rare), we could skip or use UNK.
                 # For this closed system, we assume vocab is complete.
                 pass
         return ids
 
     def decode(self, token_ids):
         """
-        Converts IDs back to a string.
+        Converts IDs back to a string with proper newlines.
         """
-        tokens = []
+        result = []
         for tid in token_ids:
             if tid == self.eos_token_id:
                 break
             if tid in [self.pad_token_id, self.bos_token_id]:
                 continue
-            tokens.append(self.id_to_token.get(tid, ''))
-            
-        # Heuristic to make it look like code again
-        # This is a bit rough, primarily for debugging
-        return ' '.join(tokens)
+
+            token = self.id_to_token.get(tid, '')
+            if tid == self.newline_token_id:
+                result.append('\n')
+            else:
+                result.append(token)
+
+        # Join with spaces, but preserve newlines
+        output = []
+        current_line = []
+        for token in result:
+            if token == '\n':
+                output.append(' '.join(current_line))
+                output.append('\n')
+                current_line = []
+            else:
+                current_line.append(token)
+
+        if current_line:
+            output.append(' '.join(current_line))
+
+        return ''.join(output)

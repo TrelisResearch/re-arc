@@ -328,10 +328,16 @@ def train():
     if use_wandb and wandb:
         wandb.init(project=cfg['wandb']['project'], config=cfg)
 
-    dataset = ARCDataset() # Full dataset (len=400 tasks)
+    dataset = ARCDataset(
+        diff_lb=cfg['dataset']['diff_lb'],
+        diff_ub=cfg['dataset']['diff_ub']
+    )
     dataloader = DataLoader(dataset, batch_size=cfg['training']['batch_size'], shuffle=True, collate_fn=collate_fn)
-    
-    val_dataset = ARCDataset()
+
+    val_dataset = ARCDataset(
+        diff_lb=cfg['dataset']['diff_lb'],
+        diff_ub=cfg['dataset']['diff_ub']
+    )
     val_dataloader = DataLoader(val_dataset, batch_size=cfg['training']['batch_size'], shuffle=True, collate_fn=collate_fn)
     
     tokenizer = dataset.tokenizer
