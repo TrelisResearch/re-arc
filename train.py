@@ -130,7 +130,7 @@ def calculate_metrics(logits, targets, pad_idx):
     
     return token_acc, exact_match_acc
 
-def run_generation(model, src, tokenizer, device, max_len=100):
+def run_generation(model, src, tokenizer, device, max_len):
     model.eval()
     with torch.no_grad():
         src_emb = model.pos_encoder(model.embedding(src) * math.sqrt(model.d_model))
@@ -157,7 +157,7 @@ def run_generation(model, src, tokenizer, device, max_len=100):
     model.train()
     return tokenizer.decode(pred_tokens)
 
-def run_generation_batch(model, src_batch, tokenizer, device, max_len=100):
+def run_generation_batch(model, src_batch, tokenizer, device, max_len):
     """Parallel batch generation"""
     model.eval()
     batch_size = src_batch.size(0)
@@ -194,7 +194,7 @@ def run_generation_batch(model, src_batch, tokenizer, device, max_len=100):
     model.train()
     return results
 
-def run_validation(model, dataloader, tokenizer, device, num_examples, global_step):
+def run_validation(model, dataloader, tokenizer, device, num_examples, global_step, max_gen_len):
     print(f"\n--- Running Validation on {num_examples} examples ---")
     
     total_loss = 0
@@ -235,7 +235,7 @@ def run_validation(model, dataloader, tokenizer, device, num_examples, global_st
             break
 
         src_batch_slice = src_batch[:batch_size_actual]
-        generated_codes = run_generation_batch(model, src_batch_slice, tokenizer, device)
+        generated_codes = run_generation_batch(model, src_batch_slice, tokenizer, device, max_len=max_gen_len)
 
         batch_syn, batch_run, batch_corr = 0, 0, 0
         for j in range(batch_size_actual):
@@ -367,45 +367,16 @@ def train():
         checkpoint = torch.load(args.resume, map_location=DEVICE)
 
         if 'model_state_dict' in checkpoint:
-            # New format checkpoint
-            state_dict = checkpoint['model_state_dict']
-            optimizer_state = checkpoint['optimizer_state_dict']
+            # New format checkpoint with optimizer state
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             start_epoch = checkpoint.get('epoch', 0)
             global_step = checkpoint.get('global_step', 0)
             best_val_correct = checkpoint.get('best_val_correct', 0.0)
-        else:
-            # Legacy checkpoint (just model weights)
-            state_dict = checkpoint
-            optimizer_state = None
-
-        # Handle vocab size mismatch (old 383 -> new 384)
-        if 'embedding.weight' in state_dict:
-            old_vocab_size = state_dict['embedding.weight'].size(0)
-            new_vocab_size = model.embedding.weight.size(0)
-
-            if old_vocab_size != new_vocab_size:
-                print(f"Vocab size mismatch: checkpoint has {old_vocab_size}, model has {new_vocab_size}")
-                print(f"Initializing new token embeddings randomly...")
-
-                # Expand embedding layer
-                old_emb = state_dict['embedding.weight']
-                new_emb = torch.randn(new_vocab_size - old_vocab_size, old_emb.size(1), device=old_emb.device) * 0.02
-                state_dict['embedding.weight'] = torch.cat([old_emb, new_emb], dim=0)
-
-                # Expand fc_out layer
-                old_fc_weight = state_dict['fc_out.weight']
-                new_fc_weight = torch.randn(new_vocab_size - old_vocab_size, old_fc_weight.size(1), device=old_fc_weight.device) * 0.02
-                state_dict['fc_out.weight'] = torch.cat([old_fc_weight, new_fc_weight], dim=0)
-
-                old_fc_bias = state_dict['fc_out.bias']
-                new_fc_bias = torch.zeros(new_vocab_size - old_vocab_size, device=old_fc_bias.device)
-                state_dict['fc_out.bias'] = torch.cat([old_fc_bias, new_fc_bias], dim=0)
-
-        model.load_state_dict(state_dict)
-        if optimizer_state:
-            optimizer.load_state_dict(optimizer_state)
             print(f"Resumed from epoch {start_epoch}, global_step {global_step}")
         else:
+            # Legacy checkpoint (just model weights)
+            model.load_state_dict(checkpoint)
             print(f"Loaded model weights only")
 
     model.train()
@@ -450,9 +421,10 @@ def train():
         
         if (epoch + 1) % cfg['validation']['interval_epochs'] == 0:
             val_loss, val_token_acc, syn_rate, run_rate, corr_rate = run_validation(
-                model, val_dataloader, tokenizer, DEVICE, 
+                model, val_dataloader, tokenizer, DEVICE,
                 num_examples=cfg['validation']['num_examples'],
-                global_step=global_step # Pass global step to validation
+                global_step=global_step,
+                max_gen_len=cfg['validation']['max_gen_len']
             )
             
             print(f"VAL >> Loss: {val_loss:.4f} | TokAcc: {val_token_acc:.2%} | Syn: {syn_rate:.1%} | Run: {run_rate:.1%} | Corr: {corr_rate:.1%}")
