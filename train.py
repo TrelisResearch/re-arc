@@ -365,17 +365,47 @@ def train():
     if args.resume:
         print(f"Loading checkpoint from {args.resume}")
         checkpoint = torch.load(args.resume, map_location=DEVICE)
+
         if 'model_state_dict' in checkpoint:
             # New format checkpoint
-            model.load_state_dict(checkpoint['model_state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            state_dict = checkpoint['model_state_dict']
+            optimizer_state = checkpoint['optimizer_state_dict']
             start_epoch = checkpoint.get('epoch', 0)
             global_step = checkpoint.get('global_step', 0)
             best_val_correct = checkpoint.get('best_val_correct', 0.0)
-            print(f"Resumed from epoch {start_epoch}, global_step {global_step}")
         else:
             # Legacy checkpoint (just model weights)
-            model.load_state_dict(checkpoint)
+            state_dict = checkpoint
+            optimizer_state = None
+
+        # Handle vocab size mismatch (old 383 -> new 384)
+        if 'embedding.weight' in state_dict:
+            old_vocab_size = state_dict['embedding.weight'].size(0)
+            new_vocab_size = model.embedding.weight.size(0)
+
+            if old_vocab_size != new_vocab_size:
+                print(f"Vocab size mismatch: checkpoint has {old_vocab_size}, model has {new_vocab_size}")
+                print(f"Initializing new token embeddings randomly...")
+
+                # Expand embedding layer
+                old_emb = state_dict['embedding.weight']
+                new_emb = torch.randn(new_vocab_size - old_vocab_size, old_emb.size(1)) * 0.02
+                state_dict['embedding.weight'] = torch.cat([old_emb, new_emb], dim=0)
+
+                # Expand fc_out layer
+                old_fc_weight = state_dict['fc_out.weight']
+                new_fc_weight = torch.randn(new_vocab_size - old_vocab_size, old_fc_weight.size(1)) * 0.02
+                state_dict['fc_out.weight'] = torch.cat([old_fc_weight, new_fc_weight], dim=0)
+
+                old_fc_bias = state_dict['fc_out.bias']
+                new_fc_bias = torch.zeros(new_vocab_size - old_vocab_size)
+                state_dict['fc_out.bias'] = torch.cat([old_fc_bias, new_fc_bias], dim=0)
+
+        model.load_state_dict(state_dict)
+        if optimizer_state:
+            optimizer.load_state_dict(optimizer_state)
+            print(f"Resumed from epoch {start_epoch}, global_step {global_step}")
+        else:
             print(f"Loaded model weights only")
 
     model.train()
