@@ -294,6 +294,10 @@ def run_validation(model, dataloader, tokenizer, device, num_examples, global_st
                         print(f"Input grid shape: {len(input_grid)}x{len(input_grid[0]) if input_grid else 0}")
                         if input_grid:
                             print(f"Input grid preview: {input_grid[:2]}")
+
+                        # Check for newlines in generated code
+                        newline_check = code.count('\n')
+                        print(f"Generated code length: {len(code)}, Newlines: {newline_check}")
                         print(code[:200] + "..." if len(code) > 200 else code)
                         print(f"Syn={is_syn}, Run={is_run}, Corr={is_corr}\n")
 

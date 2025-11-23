@@ -8,7 +8,7 @@ model:
 
 # Training Schedule
 training:
-  epochs: 1000
+  epochs: 10000
   batch_size: 64
   lr: 1.0e-4
   device: "auto"
@@ -21,7 +21,7 @@ dataset:
 
 # Validation & Execution
 validation:
-  interval_epochs: 50      # Run validation every N epochs
+  interval_epochs: 500      # Run validation every N epochs
   num_examples: 64        # Total examples to generate, execute & score for validation
   max_gen_len: 2048         # Maximum tokens to generate per example
 
