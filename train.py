@@ -137,27 +137,64 @@ def run_generation(model, src, tokenizer, device, max_len=100):
         memory = model.encoder_input_layer(src_emb)
         for _ in range(model.num_recursions):
             memory = model.recursive_layer(memory)
-            
+
         curr_tgt = torch.tensor([[tokenizer.bos_token_id]], device=device)
         pred_tokens = []
-        
-        for _ in range(max_len): 
+
+        for _ in range(max_len):
             tgt_emb = model.pos_encoder(model.embedding(curr_tgt) * math.sqrt(model.d_model))
             tgt_mask = generate_square_subsequent_mask(curr_tgt.size(1)).to(device)
             output = model.decoder(tgt_emb, memory, tgt_mask=tgt_mask)
             next_token = torch.argmax(model.fc_out(output[:, -1, :]), dim=-1).item()
-            
+
             if next_token == tokenizer.eos_token_id:
                 break
-                
+
             pred_tokens.append(next_token)
             next_token_tensor = torch.tensor([[next_token]], device=device)
             curr_tgt = torch.cat([curr_tgt, next_token_tensor], dim=1)
-    
+
     model.train()
     return tokenizer.decode(pred_tokens)
 
-def run_validation(model, dataloader, tokenizer, device, num_examples):
+def run_generation_batch(model, src_batch, tokenizer, device, max_len=100):
+    """Parallel batch generation"""
+    model.eval()
+    batch_size = src_batch.size(0)
+
+    with torch.no_grad():
+        src_emb = model.pos_encoder(model.embedding(src_batch) * math.sqrt(model.d_model))
+        memory = model.encoder_input_layer(src_emb)
+        for _ in range(model.num_recursions):
+            memory = model.recursive_layer(memory)
+
+        curr_tgt = torch.full((batch_size, 1), tokenizer.bos_token_id, device=device)
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+        for _ in range(max_len):
+            tgt_emb = model.pos_encoder(model.embedding(curr_tgt) * math.sqrt(model.d_model))
+            tgt_mask = generate_square_subsequent_mask(curr_tgt.size(1)).to(device)
+            output = model.decoder(tgt_emb, memory, tgt_mask=tgt_mask)
+            next_tokens = torch.argmax(model.fc_out(output[:, -1, :]), dim=-1)
+
+            finished |= (next_tokens == tokenizer.eos_token_id)
+            if finished.all():
+                break
+
+            curr_tgt = torch.cat([curr_tgt, next_tokens.unsqueeze(1)], dim=1)
+
+        # Decode each sequence
+        results = []
+        for i in range(batch_size):
+            tokens = curr_tgt[i, 1:].cpu().tolist()  # Skip BOS
+            if tokenizer.eos_token_id in tokens:
+                tokens = tokens[:tokens.index(tokenizer.eos_token_id)]
+            results.append(tokenizer.decode(tokens))
+
+    model.train()
+    return results
+
+def run_validation(model, dataloader, tokenizer, device, num_examples, global_step):
     print(f"\n--- Running Validation on {num_examples} examples ---")
     
     total_loss = 0
@@ -170,67 +207,89 @@ def run_validation(model, dataloader, tokenizer, device, num_examples):
     
     criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
     
+    model.eval()
+    # Iterate batch by batch until we hit num_examples
     for batch_idx, (src, tgt) in enumerate(dataloader):
         if processed_count >= num_examples:
             break
             
+        # 1. Standard Metrics (Loss/Acc) - on the whole batch
         with torch.no_grad():
-            src, tgt = src.to(device), tgt.to(device)
-            tgt_input, tgt_output = tgt[:, :-1], tgt[:, 1:]
+            src_batch, tgt_batch = src.to(device), tgt.to(device)
+            tgt_input_batch, tgt_output_batch = tgt_batch[:, :-1], tgt_batch[:, 1:]
             
-            tgt_mask = generate_square_subsequent_mask(tgt_input.size(1)).to(device)
-            src_padding_mask = (src == tokenizer.pad_token_id)
-            tgt_padding_mask = (tgt_input == tokenizer.pad_token_id)
+            tgt_mask_batch = generate_square_subsequent_mask(tgt_input_batch.size(1)).to(device)
+            src_padding_mask_batch = (src_batch == tokenizer.pad_token_id)
+            tgt_padding_mask_batch = (tgt_input_batch == tokenizer.pad_token_id)
             
-            logits = model(src, tgt_input, tgt_mask=tgt_mask, src_padding_mask=src_padding_mask, tgt_padding_mask=tgt_padding_mask)
-            loss = criterion(logits.reshape(-1, logits.shape[-1]), tgt_output.reshape(-1))
-            token_acc, _ = calculate_metrics(logits, tgt_output, tokenizer.pad_token_id)
+            logits_batch = model(src_batch, tgt_input_batch, tgt_mask=tgt_mask_batch, src_padding_mask=src_padding_mask_batch, tgt_padding_mask=tgt_padding_mask_batch)
+            loss_batch = criterion(logits_batch.reshape(-1, logits_batch.shape[-1]), tgt_output_batch.reshape(-1))
+            token_acc_batch, _ = calculate_metrics(logits_batch, tgt_output_batch, tokenizer.pad_token_id)
             
-            total_loss += loss.item()
-            total_token_acc += token_acc
+            total_loss += loss_batch.item()
+            total_token_acc += token_acc_batch
         
-        for j in range(src.size(0)):
-            if processed_count >= num_examples:
-                break
-            
+        # 2. Batch Generation & Execution
+        batch_size_actual = min(src.size(0), num_examples - processed_count)
+        if batch_size_actual <= 0:
+            break
+
+        src_batch_slice = src_batch[:batch_size_actual]
+        generated_codes = run_generation_batch(model, src_batch_slice, tokenizer, device)
+
+        for j in range(batch_size_actual):
             try:
-                src_item = src[j:j+1].to(device)
-                src_cpu = src[j].cpu().tolist()
-                
+                src_cpu = src_batch[j].cpu().tolist()
+
+                # Reconstruct Inputs
                 try:
                     sep_idx = src_cpu.index(tokenizer.sep_token_id)
                     input_ids = src_cpu[1:sep_idx]
                     input_grid = reconstruct_grid_from_tokens(input_ids, tokenizer)
-                    
+
                     output_ids = src_cpu[sep_idx+1:]
                     if tokenizer.eos_token_id in output_ids:
                         output_ids = output_ids[:output_ids.index(tokenizer.eos_token_id)]
                     target_grid = reconstruct_grid_from_tokens(output_ids, tokenizer)
-                    
-                    code = run_generation(model, src_item, tokenizer, device)
-                    
+
+                    # Execute
+                    code = generated_codes[j]
                     is_syn, is_run, is_corr = execute_and_score(code, input_grid, target_grid)
-                    
+
                     if is_syn: syntax_valid_count += 1
                     if is_run: runtime_success_count += 1
                     if is_corr: correct_count += 1
                     processed_count += 1
-                    
-                    if processed_count <= 2: 
+
+                    if processed_count <= 2:
                         print(f"Ex {processed_count}: Syn={is_syn}, Run={is_run}, Corr={is_corr}")
+
                 except ValueError:
-                    continue 
+                    continue
             except Exception as e:
-                print(f"Val Error: {e}")
+                # print(f"Val Error (execution): {e}") # Too verbose
                 continue
 
-    batches_run = batch_idx + 1 
-    avg_loss = total_loss / batches_run if batches_run else 0
-    avg_token_acc = total_token_acc / batches_run if batches_run else 0
+    # Final Stats
+    num_batches_for_std_metrics = batch_idx + 1
+    avg_loss = total_loss / num_batches_for_std_metrics if num_batches_for_std_metrics else 0
+    avg_token_acc = total_token_acc / num_batches_for_std_metrics if num_batches_for_std_metrics else 0
     
     syn_rate = syntax_valid_count / processed_count if processed_count else 0
     run_rate = runtime_success_count / processed_count if processed_count else 0
     corr_rate = correct_count / processed_count if processed_count else 0
+    
+    model.train()
+    
+    if wandb and wandb.run: # Log to wandb if active
+        wandb.log({
+            "val/loss": avg_loss,
+            "val/token_acc": avg_token_acc,
+            "val/syntax_rate": syn_rate,
+            "val/runtime_rate": run_rate,
+            "val/correct_rate": corr_rate,
+            "_step": global_step # Use global step for validation logs
+        })
     
     return avg_loss, avg_token_acc, syn_rate, run_rate, corr_rate
 
@@ -257,7 +316,7 @@ def train():
     if use_wandb and wandb:
         wandb.init(project=cfg['wandb']['project'], config=cfg)
 
-    dataset = ARCDataset() 
+    dataset = ARCDataset() # Full dataset (len=400 tasks)
     dataloader = DataLoader(dataset, batch_size=cfg['training']['batch_size'], shuffle=True, collate_fn=collate_fn)
     
     val_dataset = ARCDataset()
@@ -281,11 +340,11 @@ def train():
     save_dir = cfg['checkpoint']['save_dir']
     os.makedirs(save_dir, exist_ok=True)
     best_val_correct = 0.0
+    global_step = 0 # To track total batches for WandB
 
     model.train()
     for epoch in range(cfg['training']['epochs']):
         total_loss = 0
-        batches_processed = 0
         
         for batch_idx, (src, tgt) in enumerate(dataloader):
             if args.limit_batches and batch_idx >= args.limit_batches:
@@ -304,37 +363,33 @@ def train():
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0).item() # Log the norm AFTER clipping
             optimizer.step()
             
             total_loss += loss.item()
-            batches_processed += 1
+            global_step += 1
             
             if use_wandb:
-                wandb.log({"train_loss": loss.item()})
+                wandb.log({
+                    "train/loss": loss.item(),
+                    "train/grad_norm": grad_norm,
+                    "_step": global_step # Log with global step
+                })
             
-            if batch_idx % 10 == 0:
-                print(f"Epoch {epoch+1} | Batch {batch_idx} | Loss: {loss.item():.4f}")
+            if batch_idx % 50 == 0:
+                print(f"Epoch {epoch+1} | Batch {batch_idx} | Loss: {loss.item():.4f} | Grad Norm: {grad_norm:.4f}")
 
-        avg_loss = total_loss / batches_processed if batches_processed else 0
+        avg_loss = total_loss / (batch_idx + 1) if (batch_idx + 1) else 0
         print(f"Epoch {epoch+1} Train Loss: {avg_loss:.4f}")
         
         if (epoch + 1) % cfg['validation']['interval_epochs'] == 0:
             val_loss, val_token_acc, syn_rate, run_rate, corr_rate = run_validation(
                 model, val_dataloader, tokenizer, DEVICE, 
-                num_examples=cfg['validation']['num_examples']
+                num_examples=cfg['validation']['num_examples'],
+                global_step=global_step # Pass global step to validation
             )
             
             print(f"VAL >> Loss: {val_loss:.4f} | TokAcc: {val_token_acc:.2%} | Syn: {syn_rate:.1%} | Run: {run_rate:.1%} | Corr: {corr_rate:.1%}")
-            
-            if use_wandb:
-                wandb.log({
-                    "val_loss": val_loss,
-                    "val_token_acc": val_token_acc,
-                    "val_syntax_rate": syn_rate,
-                    "val_runtime_rate": run_rate,
-                    "val_correct_rate": corr_rate,
-                    "epoch": epoch + 1
-                })
             
             if cfg['checkpoint']['keep_best'] and corr_rate >= best_val_correct:
                 best_val_correct = corr_rate
