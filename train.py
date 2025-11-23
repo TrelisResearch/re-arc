@@ -332,13 +332,29 @@ def train():
         diff_lb=cfg['dataset']['diff_lb'],
         diff_ub=cfg['dataset']['diff_ub']
     )
-    dataloader = DataLoader(dataset, batch_size=cfg['training']['batch_size'], shuffle=True, collate_fn=collate_fn)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=cfg['training']['batch_size'],
+        shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=4,
+        pin_memory=True if DEVICE.type == 'cuda' else False,
+        persistent_workers=True
+    )
 
     val_dataset = ARCDataset(
         diff_lb=cfg['dataset']['diff_lb'],
         diff_ub=cfg['dataset']['diff_ub']
     )
-    val_dataloader = DataLoader(val_dataset, batch_size=cfg['training']['batch_size'], shuffle=True, collate_fn=collate_fn)
+    val_dataloader = DataLoader(
+        val_dataset,
+        batch_size=cfg['training']['batch_size'],
+        shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=4,
+        pin_memory=True if DEVICE.type == 'cuda' else False,
+        persistent_workers=True
+    )
     
     tokenizer = dataset.tokenizer
     
@@ -349,9 +365,18 @@ def train():
         num_recursions=cfg['model']['num_recursions'],
         dropout=cfg['model']['dropout']
     ).to(DEVICE)
-    
+
+    # Compile model for speedup (PyTorch 2.0+)
+    if hasattr(torch, 'compile'):
+        print("Compiling model with torch.compile...")
+        model = torch.compile(model)
+
     optimizer = optim.Adam(model.parameters(), lr=float(cfg['training']['lr']))
     criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
+
+    # Mixed precision training
+    scaler = torch.cuda.amp.GradScaler() if DEVICE.type == 'cuda' else None
+    use_amp = DEVICE.type == 'cuda'
 
     print(f"Model Parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
 
@@ -389,19 +414,29 @@ def train():
             
             src, tgt = src.to(DEVICE), tgt.to(DEVICE)
             tgt_input, tgt_output = tgt[:, :-1], tgt[:, 1:]
-            
+
             tgt_mask = generate_square_subsequent_mask(tgt_input.size(1)).to(DEVICE)
             src_padding_mask = (src == tokenizer.pad_token_id)
             tgt_padding_mask = (tgt_input == tokenizer.pad_token_id)
-            
-            logits = model(src, tgt_input, tgt_mask=tgt_mask, src_padding_mask=src_padding_mask, tgt_padding_mask=tgt_padding_mask)
-            loss = criterion(logits.reshape(-1, logits.shape[-1]), tgt_output.reshape(-1))
-            
+
             optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0).item() # Log the norm AFTER clipping
-            optimizer.step()
+
+            # Mixed precision forward pass
+            if use_amp:
+                with torch.cuda.amp.autocast():
+                    logits = model(src, tgt_input, tgt_mask=tgt_mask, src_padding_mask=src_padding_mask, tgt_padding_mask=tgt_padding_mask)
+                    loss = criterion(logits.reshape(-1, logits.shape[-1]), tgt_output.reshape(-1))
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0).item()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                logits = model(src, tgt_input, tgt_mask=tgt_mask, src_padding_mask=src_padding_mask, tgt_padding_mask=tgt_padding_mask)
+                loss = criterion(logits.reshape(-1, logits.shape[-1]), tgt_output.reshape(-1))
+                loss.backward()
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0).item()
+                optimizer.step()
             
             total_loss += loss.item()
             global_step += 1
