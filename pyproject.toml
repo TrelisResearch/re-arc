@@ -1,0 +1,17 @@
+[project]
+name = "re-arc-neuro-dsl"
+version = "0.1.0"
+description = "Neural Program Synthesis for ARC using a Recursive Transformer"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "torch",
+    "tqdm",
+    "matplotlib",
+    "numpy",
+    "wandb",
+    "pyyaml"
+]
+
+[tool.uv]
+dev-dependencies = []
