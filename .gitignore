@@ -18,3 +18,5 @@ wandb/
 # Editor
 .vscode/
 .idea/
+
+/checkpoints*

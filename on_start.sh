@@ -31,5 +31,5 @@ fi
 cd re-arc
 uv sync
 
-bash init.sh
+exec /start.sh
 '

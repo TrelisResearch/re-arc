@@ -72,7 +72,6 @@ def generate_square_subsequent_mask(sz):
 
 def reconstruct_grid_from_tokens(token_ids, tokenizer):
     tokens = [tokenizer.id_to_token[t] for t in token_ids if t not in [tokenizer.pad_token_id, tokenizer.bos_token_id, tokenizer.sep_token_id, tokenizer.eos_token_id]]
-    
     grid = []
     current_row = []
     for t in tokens:
@@ -158,21 +157,26 @@ def run_generation(model, src, tokenizer, device, max_len=100):
     model.train()
     return tokenizer.decode(pred_tokens)
 
-def run_validation(model, dataloader, tokenizer, device, num_examples, limit_batches=None):
-    model.eval()
+def run_validation(model, dataloader, tokenizer, device, num_examples):
+    print(f"\n--- Running Validation on {num_examples} examples ---")
+    
     total_loss = 0
     total_token_acc = 0
-    batches = 0
+    
+    syntax_valid_count = 0
+    runtime_success_count = 0
+    correct_count = 0
+    processed_count = 0
+    
     criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
     
-    # 1. Standard Validation (Loss/Acc)
-    with torch.no_grad():
-        for i, (src, tgt) in enumerate(dataloader):
-            if limit_batches and i >= limit_batches:
-                break
+    for batch_idx, (src, tgt) in enumerate(dataloader):
+        if processed_count >= num_examples:
+            break
+            
+        with torch.no_grad():
             src, tgt = src.to(device), tgt.to(device)
-            tgt_input = tgt[:, :-1]
-            tgt_output = tgt[:, 1:]
+            tgt_input, tgt_output = tgt[:, :-1], tgt[:, 1:]
             
             tgt_mask = generate_square_subsequent_mask(tgt_input.size(1)).to(device)
             src_padding_mask = (src == tokenizer.pad_token_id)
@@ -184,35 +188,15 @@ def run_validation(model, dataloader, tokenizer, device, num_examples, limit_bat
             
             total_loss += loss.item()
             total_token_acc += token_acc
-            batches += 1
-            
-    val_loss = total_loss / batches if batches else 0
-    val_token_acc = total_token_acc / batches if batches else 0
-
-    # 2. Execution Evaluation
-    syntax_valid_count = 0
-    runtime_success_count = 0
-    correct_count = 0
-    attempted = 0
-    
-    print(f"\n--- Running Execution Evaluation on {num_examples} examples ---")
-    
-    # Iterate through dataloader again for generation (single batch size effectively)
-    # This is inefficient but simple. Better to grab a batch and iterate.
-    for i, (src, tgt) in enumerate(dataloader):
-        if attempted >= num_examples:
-            break
-            
-        # Process each item in batch
+        
         for j in range(src.size(0)):
-            if attempted >= num_examples:
+            if processed_count >= num_examples:
                 break
-                
+            
             try:
                 src_item = src[j:j+1].to(device)
                 src_cpu = src[j].cpu().tolist()
                 
-                # Reconstruct Inputs
                 try:
                     sep_idx = src_cpu.index(tokenizer.sep_token_id)
                     input_ids = src_cpu[1:sep_idx]
@@ -223,44 +207,43 @@ def run_validation(model, dataloader, tokenizer, device, num_examples, limit_bat
                         output_ids = output_ids[:output_ids.index(tokenizer.eos_token_id)]
                     target_grid = reconstruct_grid_from_tokens(output_ids, tokenizer)
                     
-                    # Generate
                     code = run_generation(model, src_item, tokenizer, device)
                     
-                    # Execute
                     is_syn, is_run, is_corr = execute_and_score(code, input_grid, target_grid)
                     
                     if is_syn: syntax_valid_count += 1
                     if is_run: runtime_success_count += 1
                     if is_corr: correct_count += 1
-                    attempted += 1
+                    processed_count += 1
                     
-                    if attempted <= 3: # Print first few
-                        print(f"Ex {attempted}: Syn={{is_syn}}, Run={{is_run}}, Corr={{is_corr}}")
-                        # print(f"Code: {code[:50]}...")
-
+                    if processed_count <= 2: 
+                        print(f"Ex {processed_count}: Syn={{is_syn}}, Run={{is_run}}, Corr={{is_corr}}")
                 except ValueError:
-                    continue # Skip malformed
+                    continue 
             except Exception as e:
                 print(f"Val Error: {e}")
                 continue
 
-    syn_rate = syntax_valid_count / attempted if attempted else 0
-    run_rate = runtime_success_count / attempted if attempted else 0
-    corr_rate = correct_count / attempted if attempted else 0
+    batches_run = batch_idx + 1 
+    avg_loss = total_loss / batches_run if batches_run else 0
+    avg_token_acc = total_token_acc / batches_run if batches_run else 0
     
-    model.train()
-    return val_loss, val_token_acc, syn_rate, run_rate, corr_rate
+    syn_rate = syntax_valid_count / processed_count if processed_count else 0
+    run_rate = runtime_success_count / processed_count if processed_count else 0
+    corr_rate = correct_count / processed_count if processed_count else 0
+    
+    return avg_loss, avg_token_acc, syn_rate, run_rate, corr_rate
 
 def train():
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('--config', type=str, default='config.yaml', help='Path to config file')
     parser.add_argument('--use_wandb', action='store_true', help='Override config to enable wandb')
+    parser.add_argument('--limit_batches', type=int, default=None, help='For testing: limit training batches per epoch')
     args = parser.parse_args()
 
     with open(args.config, 'r') as f:
         cfg = yaml.safe_load(f)
 
-    # Device Setup
     if cfg['training']['device'] == "auto":
         if torch.backends.mps.is_available(): DEVICE = torch.device("mps")
         elif torch.cuda.is_available(): DEVICE = torch.device("cuda")
@@ -270,21 +253,18 @@ def train():
     
     print(f"Using Device: {DEVICE}")
 
-    # WandB
     use_wandb = cfg['wandb']['enabled'] or args.use_wandb
     if use_wandb and wandb:
         wandb.init(project=cfg['wandb']['project'], config=cfg)
 
-    # Data
-    dataset = ARCDataset(epoch_size=cfg['training']['epoch_size'])
+    dataset = ARCDataset() 
     dataloader = DataLoader(dataset, batch_size=cfg['training']['batch_size'], shuffle=True, collate_fn=collate_fn)
-    # Validation Dataloader (generate fresh ones each time to avoid overfitting to fixed set)
-    val_dataset = ARCDataset(epoch_size=200) 
-    val_dataloader = DataLoader(val_dataset, batch_size=cfg['training']['batch_size'], shuffle=False, collate_fn=collate_fn)
+    
+    val_dataset = ARCDataset()
+    val_dataloader = DataLoader(val_dataset, batch_size=cfg['training']['batch_size'], shuffle=True, collate_fn=collate_fn)
     
     tokenizer = dataset.tokenizer
     
-    # Model
     model = RecursiveDSLTransformer(
         vocab_size=tokenizer.vocab_size,
         d_model=cfg['model']['d_model'],
@@ -298,7 +278,6 @@ def train():
     
     print(f"Model Parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
     
-    # Checkpoints
     save_dir = cfg['checkpoint']['save_dir']
     os.makedirs(save_dir, exist_ok=True)
     best_val_correct = 0.0
@@ -309,6 +288,9 @@ def train():
         batches_processed = 0
         
         for batch_idx, (src, tgt) in enumerate(dataloader):
+            if args.limit_batches and batch_idx >= args.limit_batches:
+                break
+            
             src, tgt = src.to(DEVICE), tgt.to(DEVICE)
             tgt_input, tgt_output = tgt[:, :-1], tgt[:, 1:]
             
@@ -336,12 +318,10 @@ def train():
         avg_loss = total_loss / batches_processed if batches_processed else 0
         print(f"Epoch {epoch+1} Train Loss: {avg_loss:.4f}")
         
-        # --- Validation ---
         if (epoch + 1) % cfg['validation']['interval_epochs'] == 0:
             val_loss, val_token_acc, syn_rate, run_rate, corr_rate = run_validation(
                 model, val_dataloader, tokenizer, DEVICE, 
-                num_examples=cfg['validation']['num_execution_examples'],
-                limit_batches=cfg['validation']['limit_val_batches']
+                num_examples=cfg['validation']['num_examples']
             )
             
             print(f"VAL >> Loss: {val_loss:.4f} | TokAcc: {val_token_acc:.2%} | Syn: {syn_rate:.1%} | Run: {run_rate:.1%} | Corr: {corr_rate:.1%}")
@@ -356,13 +336,11 @@ def train():
                     "epoch": epoch + 1
                 })
             
-            # Save Best
             if cfg['checkpoint']['keep_best'] and corr_rate >= best_val_correct:
                 best_val_correct = corr_rate
                 torch.save(model.state_dict(), os.path.join(save_dir, "model_best.pt"))
                 print("Saved Best Model!")
 
-        # --- Periodic Save ---
         if (epoch + 1) % cfg['checkpoint']['save_every_n_epochs'] == 0:
             torch.save(model.state_dict(), os.path.join(save_dir, f"model_epoch_{epoch+1}.pt"))
 

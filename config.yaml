@@ -1,6 +1,6 @@
 # Model Architecture
 model:
-  vocab_size: 400 # Approximate, tokenizer will override
+  vocab_size: 400
   d_model: 512
   n_head: 8
   num_recursions: 8
@@ -9,16 +9,14 @@ model:
 # Training Schedule
 training:
   epochs: 100
-  epoch_size: 1000
-  batch_size: 32
+  batch_size: 64
   lr: 1.0e-4
-  device: "auto" # "auto", "cuda", "mps", "cpu"
+  device: "auto"
 
 # Validation & Execution
 validation:
   interval_epochs: 5      # Run validation every N epochs
-  num_execution_examples: 16 # How many generated programs to execute and score per check
-  limit_val_batches: 4     # How many batches to run for standard val loss/token_acc
+  num_examples: 32        # Total examples to generate, execute & score for validation
 
 # Checkpointing
 checkpoint:
@@ -28,5 +26,5 @@ checkpoint:
 
 # Logging
 wandb:
-  enabled: false # Can be overridden by CLI --use_wandb
+  enabled: true 
   project: "arc-neuro-dsl"
