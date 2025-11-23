@@ -66,9 +66,9 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 def generate_square_subsequent_mask(sz):
-    mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
-    mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
-    return mask
+    """Generate causal mask for autoregressive decoding (boolean version for PyTorch 2.0+)"""
+    mask = torch.triu(torch.ones(sz, sz, dtype=torch.bool), diagonal=1)
+    return mask  # True = masked (ignore), False = attend
 
 def reconstruct_grid_from_tokens(token_ids, tokenizer):
     tokens = [tokenizer.id_to_token[t] for t in token_ids if t not in [tokenizer.pad_token_id, tokenizer.bos_token_id, tokenizer.sep_token_id, tokenizer.eos_token_id]]
@@ -276,6 +276,8 @@ def run_validation(model, dataloader, tokenizer, device, num_examples, global_st
 
                     if processed_count <= 3:
                         print(f"\n--- Generated Code Sample {processed_count} ---")
+                        print(f"Input grid shape: {len(input_grid)}x{len(input_grid[0]) if input_grid else 0}")
+                        print(f"First few input tokens: {src_cpu[:20]}")
                         print(code)
                         print(f"Syn={is_syn}, Run={is_run}, Corr={is_corr}\n")
 

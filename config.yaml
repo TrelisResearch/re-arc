@@ -12,7 +12,7 @@ training:
   batch_size: 64
   lr: 1.0e-4
   device: "auto"
-  use_torch_compile: false  # Set to true to enable torch.compile (may crash on some models)
+  use_torch_compile: true  # torch.compile for 20-40% speedup
 
 # Dataset
 dataset:
