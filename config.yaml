@@ -9,7 +9,7 @@ model:
 # Training Schedule
 training:
   epochs: 1000
-  batch_size: 128
+  batch_size: 64
   lr: 1.0e-4
   device: "auto"
 
