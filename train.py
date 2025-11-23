@@ -217,7 +217,7 @@ def run_validation(model, dataloader, tokenizer, device, num_examples):
                     processed_count += 1
                     
                     if processed_count <= 2: 
-                        print(f"Ex {processed_count}: Syn={{is_syn}}, Run={{is_run}}, Corr={{is_corr}}")
+                        print(f"Ex {processed_count}: Syn={is_syn}, Run={is_run}, Corr={is_corr}")
                 except ValueError:
                     continue 
             except Exception as e:

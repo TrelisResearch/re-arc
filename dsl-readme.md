@@ -1,4 +1,5 @@
 # Neuro-DSL Project Plan
+[Runpod one-click affiliate template](https://console.runpod.io/deploy?template=6w7lls0jx4&ref=jmfkcdio)
 
 ## Current Status
 - [x] Basic Tokenizer (`tokenizer.py`)
