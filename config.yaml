@@ -1,6 +1,6 @@
 # Model Architecture
 model:
-  vocab_size: 384  # Updated to match tokenizer with [NEWLINE]
+  vocab_size: 384  # 6 special + DSL constants (ZERO-NINE for colors) + verifier tokens
   d_model: 256
   n_head: 8
   num_recursions: 16

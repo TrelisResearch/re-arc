@@ -1,6 +1,6 @@
 # Model Architecture
 model:
-  vocab_size: 400
+  vocab_size: 384  # 6 special + DSL constants (ZERO-NINE for colors) + verifier tokens
   d_model: 256
   n_head: 8
   num_recursions: 8
@@ -10,13 +10,20 @@ model:
 training:
   epochs: 10
   batch_size: 8
-  lr: 2.5e-5
+  lr: 1e-4
   device: "auto"
+  use_torch_compile: false  # torch.compile for 20-40% speedup (disable on Mac)
+
+# Dataset
+dataset:
+  diff_lb: 0.0  # Difficulty lower bound
+  diff_ub: 0.5  # Difficulty upper bound
 
 # Validation & Execution
 validation:
   interval_epochs: 1      # Run validation every N epochs
-  num_examples: 400        # Total examples to generate, execute & score for validation
+  num_examples: 8        # Total examples to generate, execute & score for validation
+  max_gen_len: 256       # Maximum tokens to generate per example
 
 # Checkpointing
 checkpoint:
@@ -26,5 +33,5 @@ checkpoint:
 
 # Logging
 wandb:
-  enabled: true 
+  enabled: true
   project: "arc-neuro-dsl"

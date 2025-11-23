@@ -11,7 +11,7 @@ class DSLTokenizer:
     def build_vocab(self):
         # 1. Special Tokens
         special_tokens = ['[PAD]', '[BOS]', '[EOS]', '[SEP]', '[ROW]', '[NEWLINE]']
-        
+
         # 2. Primitives from DSL
         dsl_tokens = sorted([name for name in dir(dsl) if not name.startswith('__')])
         
@@ -61,18 +61,26 @@ class DSLTokenizer:
     def encode_grid(self, grid):
         """
         Flattens a grid into a sequence of token IDs.
-        Format: 0 0 1 [ROW] 2 2 0 [ROW] ...
+        Maps color integers to DSL constant names (0->ZERO, 1->ONE, etc.)
+        Format: ZERO ZERO ONE [ROW] TWO TWO ZERO [ROW] ...
         """
+        # Mapping from integer colors to DSL constant names
+        color_to_const = {
+            0: 'ZERO', 1: 'ONE', 2: 'TWO', 3: 'THREE', 4: 'FOUR',
+            5: 'FIVE', 6: 'SIX', 7: 'SEVEN', 8: 'EIGHT', 9: 'NINE'
+        }
+
         tokens = []
         for row in grid:
             for cell in row:
-                # cell is an integer, convert to string token
-                tokens.append(str(cell))
+                # Map cell integer to DSL constant name
+                const_name = color_to_const.get(cell, 'ZERO')
+                tokens.append(const_name)
             tokens.append('[ROW]')
         # Remove last [ROW]
         if tokens:
             tokens.pop()
-        
+
         return [self.token_to_id.get(t, self.token_to_id['[PAD]']) for t in tokens]
 
     def encode_code(self, code_string):

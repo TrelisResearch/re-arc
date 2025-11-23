@@ -11,6 +11,7 @@ import yaml
 import ast
 import dsl
 from dsl import *
+from tqdm import tqdm
 
 try:
     import wandb
@@ -71,6 +72,12 @@ def generate_square_subsequent_mask(sz):
     return mask  # True = masked (ignore), False = attend
 
 def reconstruct_grid_from_tokens(token_ids, tokenizer):
+    # Mapping from DSL constant names back to integers
+    const_to_color = {
+        'ZERO': 0, 'ONE': 1, 'TWO': 2, 'THREE': 3, 'FOUR': 4,
+        'FIVE': 5, 'SIX': 6, 'SEVEN': 7, 'EIGHT': 8, 'NINE': 9
+    }
+
     tokens = [tokenizer.id_to_token[t] for t in token_ids if t not in [tokenizer.pad_token_id, tokenizer.bos_token_id, tokenizer.sep_token_id, tokenizer.eos_token_id]]
     grid = []
     current_row = []
@@ -79,7 +86,11 @@ def reconstruct_grid_from_tokens(token_ids, tokenizer):
             if current_row:
                 grid.append(tuple(current_row))
             current_row = []
+        elif t in const_to_color:
+            # Map DSL constant back to integer
+            current_row.append(const_to_color[t])
         else:
+            # Try parsing as integer (legacy support)
             try:
                 current_row.append(int(t))
             except:
@@ -215,7 +226,8 @@ def run_validation(model, dataloader, tokenizer, device, num_examples, global_st
     
     model.eval()
     # Iterate batch by batch until we hit num_examples
-    for batch_idx, (src, tgt) in enumerate(dataloader):
+    pbar = tqdm(enumerate(dataloader), total=min(len(dataloader), (num_examples + dataloader.batch_size - 1) // dataloader.batch_size), desc="Validation")
+    for batch_idx, (src, tgt) in pbar:
         if processed_count >= num_examples:
             break
             
@@ -275,10 +287,14 @@ def run_validation(model, dataloader, tokenizer, device, num_examples, global_st
                     processed_count += 1
 
                     if processed_count <= 3:
-                        print(f"\n--- Generated Code Sample {processed_count} ---")
+                        print(f"\n--- Generated Code Sample {processed_count} (batch={batch_idx}, j={j}) ---")
+                        print(f"SEP index: {sep_idx}, Total source length: {len(src_cpu)}")
+                        print(f"Input token IDs (BOS to SEP): {src_cpu[1:sep_idx][:30]}...")
+                        print(f"Decoded input tokens: {[tokenizer.id_to_token.get(t, '?') for t in src_cpu[1:sep_idx][:30]]}")
                         print(f"Input grid shape: {len(input_grid)}x{len(input_grid[0]) if input_grid else 0}")
-                        print(f"First few input tokens: {src_cpu[:20]}")
-                        print(code)
+                        if input_grid:
+                            print(f"Input grid preview: {input_grid[:2]}")
+                        print(code[:200] + "..." if len(code) > 200 else code)
                         print(f"Syn={is_syn}, Run={is_run}, Corr={is_corr}\n")
 
                 except ValueError:
@@ -287,17 +303,25 @@ def run_validation(model, dataloader, tokenizer, device, num_examples, global_st
                 # print(f"Val Error (execution): {e}") # Too verbose
                 continue
 
-        print(f"Batch {batch_idx+1}: {processed_count}/{num_examples} | Syn: {batch_syn}/{batch_size_actual} | Run: {batch_run}/{batch_size_actual} | Corr: {batch_corr}/{batch_size_actual}")
+        # Update progress bar with cumulative rates
+        pbar.set_postfix({
+            'processed': f'{processed_count}/{num_examples}',
+            'syn': f'{syntax_valid_count}/{processed_count}' if processed_count else '0/0',
+            'run': f'{runtime_success_count}/{processed_count}' if processed_count else '0/0',
+            'corr': f'{correct_count}/{processed_count}' if processed_count else '0/0'
+        })
+
+    pbar.close()
 
     # Final Stats
     num_batches_for_std_metrics = batch_idx + 1
     avg_loss = total_loss / num_batches_for_std_metrics if num_batches_for_std_metrics else 0
     avg_token_acc = total_token_acc / num_batches_for_std_metrics if num_batches_for_std_metrics else 0
-    
+
     syn_rate = syntax_valid_count / processed_count if processed_count else 0
     run_rate = runtime_success_count / processed_count if processed_count else 0
     corr_rate = correct_count / processed_count if processed_count else 0
-    
+
     model.train()
     
     if wandb and wandb.run: # Log to wandb if active
@@ -429,11 +453,12 @@ def train():
     model.train()
     for epoch in range(start_epoch, cfg['training']['epochs']):
         total_loss = 0
-        
-        for batch_idx, (src, tgt) in enumerate(dataloader):
+
+        pbar = tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Epoch {epoch+1}/{cfg['training']['epochs']}")
+        for batch_idx, (src, tgt) in pbar:
             if args.limit_batches and batch_idx >= args.limit_batches:
                 break
-            
+
             src, tgt = src.to(DEVICE), tgt.to(DEVICE)
             tgt_input, tgt_output = tgt[:, :-1], tgt[:, 1:]
 
@@ -459,22 +484,23 @@ def train():
                 loss.backward()
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0).item()
                 optimizer.step()
-            
+
             total_loss += loss.item()
             global_step += 1
-            
+
+            # Update progress bar
+            pbar.set_postfix({'loss': f'{loss.item():.4f}', 'grad_norm': f'{grad_norm:.4f}'})
+
             if use_wandb:
                 wandb.log({
                     "train/loss": loss.item(),
                     "train/grad_norm": grad_norm,
-                    "_step": global_step # Log with global step
+                    "_step": global_step
                 })
-            
-            if batch_idx % 50 == 0:
-                print(f"Epoch {epoch+1} | Batch {batch_idx} | Loss: {loss.item():.4f} | Grad Norm: {grad_norm:.4f}")
 
+        pbar.close()
         avg_loss = total_loss / (batch_idx + 1) if (batch_idx + 1) else 0
-        print(f"Epoch {epoch+1} Train Loss: {avg_loss:.4f}")
+        print(f"Epoch {epoch+1} completed - Avg Loss: {avg_loss:.4f}")
         
         if (epoch + 1) % cfg['validation']['interval_epochs'] == 0:
             val_loss, val_token_acc, syn_rate, run_rate, corr_rate = run_validation(
