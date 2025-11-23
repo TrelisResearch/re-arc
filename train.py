@@ -329,7 +329,12 @@ def train():
         else: DEVICE = torch.device("cpu")
     else:
         DEVICE = torch.device(cfg['training']['device'])
-    
+
+    # Enable TF32 for better performance on Ampere/Hopper GPUs
+    if DEVICE.type == 'cuda':
+        torch.set_float32_matmul_precision('high')
+        print("Enabled TF32 for matmul operations")
+
     print(f"Using Device: {DEVICE}")
 
     use_wandb = cfg['wandb']['enabled'] or args.use_wandb
@@ -387,9 +392,13 @@ def train():
     optimizer = optim.Adam(model.parameters(), lr=float(cfg['training']['lr']))
     criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
 
-    # Mixed precision training
-    scaler = torch.amp.GradScaler('cuda') if DEVICE.type == 'cuda' else None
+    # Mixed precision training (BF16 on CUDA for better stability on Ampere/Hopper)
     use_amp = DEVICE.type == 'cuda'
+    amp_dtype = torch.bfloat16 if DEVICE.type == 'cuda' else torch.float16
+    # BF16 doesn't need GradScaler, but keeping for FP16 fallback compatibility
+    scaler = torch.amp.GradScaler('cuda') if DEVICE.type == 'cuda' else None
+    if use_amp:
+        print(f"Using AMP with dtype: {amp_dtype}")
 
     print(f"Model Parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
 
@@ -436,7 +445,7 @@ def train():
 
             # Mixed precision forward pass
             if use_amp:
-                with torch.amp.autocast('cuda'):
+                with torch.amp.autocast('cuda', dtype=amp_dtype):
                     logits = model(src, tgt_input, tgt_mask=tgt_mask, src_padding_mask=src_padding_mask, tgt_padding_mask=tgt_padding_mask)
                     loss = criterion(logits.reshape(-1, logits.shape[-1]), tgt_output.reshape(-1))
                 scaler.scale(loss).backward()
