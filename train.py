@@ -89,12 +89,6 @@ def reconstruct_grid_from_tokens(token_ids, tokenizer):
         elif t in const_to_color:
             # Map DSL constant back to integer
             current_row.append(const_to_color[t])
-        else:
-            # Try parsing as integer (legacy support)
-            try:
-                current_row.append(int(t))
-            except:
-                pass
     if current_row:
         grid.append(tuple(current_row))
     return tuple(grid)
@@ -140,36 +134,6 @@ def calculate_metrics(logits, targets, pad_idx):
     exact_match_acc = (~row_has_error).float().mean().item()
     
     return token_acc, exact_match_acc
-
-def run_generation(model, src, tokenizer, device, max_len):
-    model.eval()
-    with torch.no_grad():
-        # Compute source padding mask
-        src_padding_mask = (src == tokenizer.pad_token_id)
-
-        src_emb = model.pos_encoder(model.embedding(src) * math.sqrt(model.d_model))
-        memory = model.encoder_input_layer(src_emb, src_key_padding_mask=src_padding_mask)
-        for _ in range(model.num_recursions):
-            memory = model.recursive_layer(memory, src_key_padding_mask=src_padding_mask)
-
-        curr_tgt = torch.tensor([[tokenizer.bos_token_id]], device=device)
-        pred_tokens = []
-
-        for _ in range(max_len):
-            tgt_emb = model.pos_encoder(model.embedding(curr_tgt) * math.sqrt(model.d_model))
-            tgt_mask = generate_square_subsequent_mask(curr_tgt.size(1)).to(device)
-            output = model.decoder(tgt_emb, memory, tgt_mask=tgt_mask, memory_key_padding_mask=src_padding_mask)
-            next_token = torch.argmax(model.fc_out(output[:, -1, :]), dim=-1).item()
-
-            if next_token == tokenizer.eos_token_id:
-                break
-
-            pred_tokens.append(next_token)
-            next_token_tensor = torch.tensor([[next_token]], device=device)
-            curr_tgt = torch.cat([curr_tgt, next_token_tensor], dim=1)
-
-    model.train()
-    return tokenizer.decode(pred_tokens)
 
 def run_generation_batch(model, src_batch, tokenizer, device, max_len):
     """Parallel batch generation"""
@@ -424,9 +388,7 @@ def train():
 
     # Mixed precision training (BF16 on CUDA for better stability on Ampere/Hopper)
     use_amp = DEVICE.type == 'cuda'
-    amp_dtype = torch.bfloat16 if DEVICE.type == 'cuda' else torch.float16
-    # BF16 doesn't need GradScaler, but keeping for FP16 fallback compatibility
-    scaler = torch.amp.GradScaler('cuda') if DEVICE.type == 'cuda' else None
+    amp_dtype = torch.bfloat16
     if use_amp:
         print(f"Using AMP with dtype: {amp_dtype}")
 
@@ -443,18 +405,12 @@ def train():
         print(f"Loading checkpoint from {args.resume}")
         checkpoint = torch.load(args.resume, map_location=DEVICE)
 
-        if 'model_state_dict' in checkpoint:
-            # New format checkpoint with optimizer state
-            model.load_state_dict(checkpoint['model_state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            start_epoch = checkpoint.get('epoch', 0)
-            global_step = checkpoint.get('global_step', 0)
-            best_val_correct = checkpoint.get('best_val_correct', 0.0)
-            print(f"Resumed from epoch {start_epoch}, global_step {global_step}")
-        else:
-            # Legacy checkpoint (just model weights)
-            model.load_state_dict(checkpoint)
-            print(f"Loaded model weights only")
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint.get('epoch', 0)
+        global_step = checkpoint.get('global_step', 0)
+        best_val_correct = checkpoint.get('best_val_correct', 0.0)
+        print(f"Resumed from epoch {start_epoch}, global_step {global_step}")
 
     model.train()
     for epoch in range(start_epoch, cfg['training']['epochs']):
@@ -474,16 +430,14 @@ def train():
 
             optimizer.zero_grad()
 
-            # Mixed precision forward pass
+            # Mixed precision forward pass (BF16 doesn't need GradScaler)
             if use_amp:
                 with torch.amp.autocast('cuda', dtype=amp_dtype):
                     logits = model(src, tgt_input, tgt_mask=tgt_mask, src_padding_mask=src_padding_mask, tgt_padding_mask=tgt_padding_mask)
                     loss = criterion(logits.reshape(-1, logits.shape[-1]), tgt_output.reshape(-1))
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
+                loss.backward()
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0).item()
-                scaler.step(optimizer)
-                scaler.update()
+                optimizer.step()
             else:
                 logits = model(src, tgt_input, tgt_mask=tgt_mask, src_padding_mask=src_padding_mask, tgt_padding_mask=tgt_padding_mask)
                 loss = criterion(logits.reshape(-1, logits.shape[-1]), tgt_output.reshape(-1))
