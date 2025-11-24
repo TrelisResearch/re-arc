@@ -99,8 +99,8 @@ class DSLTokenizer:
             elif t in self.token_to_id:
                 ids.append(self.token_to_id[t])
             else:
-                # If unknown token (rare), we could skip or use UNK.
-                # For this closed system, we assume vocab is complete.
+                # Unknown token encountered - this suggests vocab incompleteness
+                print(f"WARNING: Unknown token '{t}' encountered during encoding. Skipping.")
                 pass
         return ids
 

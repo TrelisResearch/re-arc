@@ -13,7 +13,10 @@
 
 ## TODO
 - [ ] **Review code overall**
-- [ ] **Review architecture**
+    - [ ] Review tokenizer
+    - [ ] Review data prep
+    - [ ] Review training code
+- [ ] **Review architecture** Ensure choices make sense for the application at hand.
 - [ ] **Guided Decoding**: Constrain generation.
 - [ ] **Static Analysis Optimization**: Filter programs with `ast.parse` and symbol checks before expensive execution.
 - [ ] Do predicted programs include upper and lower bound parameters? if so, that could be powerful for data augmentation.
