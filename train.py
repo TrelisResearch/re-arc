@@ -36,8 +36,8 @@ class RecursiveDSLTransformer(nn.Module):
         self.fc_out = nn.Linear(d_model, vocab_size)
 
     def forward(self, src, tgt, src_mask=None, tgt_mask=None, src_padding_mask=None, tgt_padding_mask=None):
-        src_emb = self.pos_encoder(self.embedding(src) * math.sqrt(self.d_model))
-        tgt_emb = self.pos_encoder(self.embedding(tgt) * math.sqrt(self.d_model))
+        src_emb = self.pos_encoder(self.embedding(src))
+        tgt_emb = self.pos_encoder(self.embedding(tgt))
         
         memory = self.encoder_input_layer(src_emb, src_key_padding_mask=src_padding_mask)
         
@@ -144,7 +144,7 @@ def run_generation_batch(model, src_batch, tokenizer, device, max_len):
         # Compute source padding mask
         src_padding_mask = (src_batch == tokenizer.pad_token_id)
 
-        src_emb = model.pos_encoder(model.embedding(src_batch) * math.sqrt(model.d_model))
+        src_emb = model.pos_encoder(model.embedding(src_batch))
         memory = model.encoder_input_layer(src_emb, src_key_padding_mask=src_padding_mask)
         for _ in range(model.num_recursions):
             memory = model.recursive_layer(memory, src_key_padding_mask=src_padding_mask)
@@ -153,7 +153,7 @@ def run_generation_batch(model, src_batch, tokenizer, device, max_len):
         finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
         for _ in range(max_len):
-            tgt_emb = model.pos_encoder(model.embedding(curr_tgt) * math.sqrt(model.d_model))
+            tgt_emb = model.pos_encoder(model.embedding(curr_tgt))
             tgt_mask = generate_square_subsequent_mask(curr_tgt.size(1)).to(device)
             output = model.decoder(tgt_emb, memory, tgt_mask=tgt_mask, memory_key_padding_mask=src_padding_mask)
             next_tokens = torch.argmax(model.fc_out(output[:, -1, :]), dim=-1)
