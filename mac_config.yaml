@@ -3,13 +3,14 @@ model:
   vocab_size: 384  # 6 special + DSL constants (ZERO-NINE for colors) + verifier tokens
   d_model: 256
   n_head: 8
+  num_layers: 1
   num_recursions: 8
   dropout: 0.1
 
 # Training Schedule
 training:
   epochs: 10
-  batch_size: 8
+  batch_size: 4
   lr: 1e-4
   device: "auto"
   use_torch_compile: false  # torch.compile for 20-40% speedup (disable on Mac)

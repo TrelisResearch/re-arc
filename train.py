@@ -18,37 +18,55 @@ try:
 except ImportError:
     wandb = None
 
-class RecursiveDSLTransformer(nn.Module):
-    def __init__(self, vocab_size, d_model=512, n_head=8, num_recursions=8, dropout=0.1):
+class DecoderOnlyDSLTransformer(nn.Module):
+    def __init__(self, vocab_size, d_model=512, n_head=8, num_layers=16, num_recursions=1, dropout=0.1):
         super().__init__()
         self.d_model = d_model
+        self.num_layers = num_layers
         self.num_recursions = num_recursions
-        
+
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.pos_encoder = PositionalEncoding(d_model, dropout)
 
-        self.encoder_input_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=n_head, dim_feedforward=2048, dropout=dropout, batch_first=True)
-        self.recursive_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=n_head, dim_feedforward=2048, dropout=dropout, batch_first=True)
+        # Build decoder stack
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=d_model,
+            nhead=n_head,
+            dim_feedforward=d_model * 4,  # Standard 4x expansion
+            dropout=dropout,
+            batch_first=True
+        )
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
 
-        self.decoder_layer = nn.TransformerDecoderLayer(d_model=d_model, nhead=n_head, dim_feedforward=2048, dropout=dropout, batch_first=True)
-        self.decoder = nn.TransformerDecoder(self.decoder_layer, num_layers=2) 
-        
         self.fc_out = nn.Linear(d_model, vocab_size)
 
-    def forward(self, src, tgt, src_mask=None, tgt_mask=None, src_padding_mask=None, tgt_padding_mask=None):
-        src_emb = self.pos_encoder(self.embedding(src))
-        tgt_emb = self.pos_encoder(self.embedding(tgt))
-        
-        memory = self.encoder_input_layer(src_emb, src_key_padding_mask=src_padding_mask)
-        
+    def forward(self, tokens, mask=None, padding_mask=None):
+        """
+        Decoder-only forward pass (GPT-style) with optional recursion.
+        Args:
+            tokens: [batch, seq_len] token IDs
+            mask: [seq_len, seq_len] causal attention mask
+            padding_mask: [batch, seq_len] padding mask
+        Returns:
+            logits: [batch, seq_len, vocab_size]
+        """
+        # Embed and add positions
+        x = self.pos_encoder(self.embedding(tokens))
+
+        # Apply decoder stack recursively for self-refinement
+        # When num_recursions=1, this is standard GPT-style
+        # When num_recursions>1, we recursively refine representations
         for _ in range(self.num_recursions):
-            memory = self.recursive_layer(memory, src_key_padding_mask=src_padding_mask)
-            
-        output = self.decoder(tgt_emb, memory, tgt_mask=tgt_mask, 
-                              tgt_key_padding_mask=tgt_padding_mask,
-                              memory_key_padding_mask=src_padding_mask)
-        
-        return self.fc_out(output)
+            # In decoder-only, we pass the same input as both tgt and memory
+            x = self.decoder(
+                tgt=x,
+                memory=x,
+                tgt_mask=mask,
+                tgt_key_padding_mask=padding_mask,
+                memory_key_padding_mask=padding_mask
+            )
+
+        return self.fc_out(x)
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, dropout=0.1, max_len=5000):
@@ -136,41 +154,47 @@ def calculate_metrics(logits, targets, pad_idx):
     return token_acc, exact_match_acc
 
 def run_generation_batch(model, src_batch, tokenizer, device, max_len):
-    """Parallel batch generation"""
+    """Parallel batch generation for decoder-only model"""
     model.eval()
     batch_size = src_batch.size(0)
 
     with torch.no_grad():
-        # Compute source padding mask
-        src_padding_mask = (src_batch == tokenizer.pad_token_id)
-
-        src_emb = model.pos_encoder(model.embedding(src_batch))
-        memory = model.encoder_input_layer(src_emb, src_key_padding_mask=src_padding_mask)
-        for _ in range(model.num_recursions):
-            memory = model.recursive_layer(memory, src_key_padding_mask=src_padding_mask)
-
-        curr_tgt = torch.full((batch_size, 1), tokenizer.bos_token_id, device=device)
+        # Start with src (which contains: [BOS] input_grid [SEP] output_grid [SEP])
+        # We'll autoregressively generate the code tokens after the second [SEP]
+        curr_tokens = src_batch.to(device)
         finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
         for _ in range(max_len):
-            tgt_emb = model.pos_encoder(model.embedding(curr_tgt))
-            tgt_mask = generate_square_subsequent_mask(curr_tgt.size(1)).to(device)
-            output = model.decoder(tgt_emb, memory, tgt_mask=tgt_mask, memory_key_padding_mask=src_padding_mask)
-            next_tokens = torch.argmax(model.fc_out(output[:, -1, :]), dim=-1)
+            seq_len = curr_tokens.size(1)
+            causal_mask = generate_square_subsequent_mask(seq_len).to(device)
+            padding_mask = (curr_tokens == tokenizer.pad_token_id)
 
+            # Forward pass through decoder-only model
+            logits = model(curr_tokens, mask=causal_mask, padding_mask=padding_mask)
+
+            # Get next token predictions (last position)
+            next_tokens = torch.argmax(logits[:, -1, :], dim=-1)
+
+            # Check for EOS
             finished |= (next_tokens == tokenizer.eos_token_id)
             if finished.all():
                 break
 
-            curr_tgt = torch.cat([curr_tgt, next_tokens.unsqueeze(1)], dim=1)
+            # Append next tokens
+            curr_tokens = torch.cat([curr_tokens, next_tokens.unsqueeze(1)], dim=1)
 
-        # Decode each sequence
+        # Decode each sequence - extract only the generated code part (after src)
         results = []
+        src_len = src_batch.size(1)
         for i in range(batch_size):
-            tokens = curr_tgt[i, 1:].cpu().tolist()  # Skip BOS
-            if tokenizer.eos_token_id in tokens:
-                tokens = tokens[:tokens.index(tokenizer.eos_token_id)]
-            results.append(tokenizer.decode(tokens))
+            # Get tokens generated after the source prompt
+            generated_tokens = curr_tokens[i, src_len:].cpu().tolist()
+
+            # Stop at EOS
+            if tokenizer.eos_token_id in generated_tokens:
+                generated_tokens = generated_tokens[:generated_tokens.index(tokenizer.eos_token_id)]
+
+            results.append(tokenizer.decode(generated_tokens))
 
     model.train()
     return results
@@ -198,16 +222,20 @@ def run_validation(model, dataloader, tokenizer, device, num_examples, global_st
         # 1. Standard Metrics (Loss/Acc) - on the whole batch
         with torch.no_grad():
             src_batch, tgt_batch = src.to(device), tgt.to(device)
-            tgt_input_batch, tgt_output_batch = tgt_batch[:, :-1], tgt_batch[:, 1:]
-            
-            tgt_mask_batch = generate_square_subsequent_mask(tgt_input_batch.size(1)).to(device)
-            src_padding_mask_batch = (src_batch == tokenizer.pad_token_id)
-            tgt_padding_mask_batch = (tgt_input_batch == tokenizer.pad_token_id)
-            
-            logits_batch = model(src_batch, tgt_input_batch, tgt_mask=tgt_mask_batch, src_padding_mask=src_padding_mask_batch, tgt_padding_mask=tgt_padding_mask_batch)
-            loss_batch = criterion(logits_batch.reshape(-1, logits_batch.shape[-1]), tgt_output_batch.reshape(-1))
-            token_acc_batch, _ = calculate_metrics(logits_batch, tgt_output_batch, tokenizer.pad_token_id)
-            
+
+            # Decoder-only: concatenate src and tgt
+            tokens_batch = torch.cat([src_batch, tgt_batch], dim=1)
+            input_tokens_batch = tokens_batch[:, :-1]
+            target_tokens_batch = tokens_batch[:, 1:]
+
+            seq_len_batch = input_tokens_batch.size(1)
+            causal_mask_batch = generate_square_subsequent_mask(seq_len_batch).to(device)
+            padding_mask_batch = (input_tokens_batch == tokenizer.pad_token_id)
+
+            logits_batch = model(input_tokens_batch, mask=causal_mask_batch, padding_mask=padding_mask_batch)
+            loss_batch = criterion(logits_batch.reshape(-1, logits_batch.shape[-1]), target_tokens_batch.reshape(-1))
+            token_acc_batch, _ = calculate_metrics(logits_batch, target_tokens_batch, tokenizer.pad_token_id)
+
             total_loss += loss_batch.item()
             total_token_acc += token_acc_batch
         
@@ -364,11 +392,12 @@ def train():
     )
     
     tokenizer = dataset.tokenizer
-    
-    model = RecursiveDSLTransformer(
+
+    model = DecoderOnlyDSLTransformer(
         vocab_size=tokenizer.vocab_size,
         d_model=cfg['model']['d_model'],
         n_head=cfg['model']['n_head'],
+        num_layers=cfg['model']['num_layers'],
         num_recursions=cfg['model']['num_recursions'],
         dropout=cfg['model']['dropout']
     ).to(DEVICE)
@@ -421,26 +450,34 @@ def train():
             if args.limit_batches and batch_idx >= args.limit_batches:
                 break
 
-            src, tgt = src.to(DEVICE), tgt.to(DEVICE)
-            tgt_input, tgt_output = tgt[:, :-1], tgt[:, 1:]
+            # Decoder-only: concatenate src and tgt into single sequence
+            # src already contains: [BOS] input_grid [SEP] output_grid [SEP]
+            # tgt contains: code tokens [EOS]
+            # Concatenate them: [BOS] input_grid [SEP] output_grid [SEP] code [EOS]
+            tokens = torch.cat([src, tgt], dim=1).to(DEVICE)
 
-            tgt_mask = generate_square_subsequent_mask(tgt_input.size(1)).to(DEVICE)
-            src_padding_mask = (src == tokenizer.pad_token_id)
-            tgt_padding_mask = (tgt_input == tokenizer.pad_token_id)
+            # Shift for next-token prediction
+            input_tokens = tokens[:, :-1]   # Everything except last token
+            target_tokens = tokens[:, 1:]   # Everything except first token
+
+            # Create causal mask and padding mask
+            seq_len = input_tokens.size(1)
+            causal_mask = generate_square_subsequent_mask(seq_len).to(DEVICE)
+            padding_mask = (input_tokens == tokenizer.pad_token_id)
 
             optimizer.zero_grad()
 
             # Mixed precision forward pass (BF16 doesn't need GradScaler)
             if use_amp:
                 with torch.amp.autocast('cuda', dtype=amp_dtype):
-                    logits = model(src, tgt_input, tgt_mask=tgt_mask, src_padding_mask=src_padding_mask, tgt_padding_mask=tgt_padding_mask)
-                    loss = criterion(logits.reshape(-1, logits.shape[-1]), tgt_output.reshape(-1))
+                    logits = model(input_tokens, mask=causal_mask, padding_mask=padding_mask)
+                    loss = criterion(logits.reshape(-1, logits.shape[-1]), target_tokens.reshape(-1))
                 loss.backward()
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0).item()
                 optimizer.step()
             else:
-                logits = model(src, tgt_input, tgt_mask=tgt_mask, src_padding_mask=src_padding_mask, tgt_padding_mask=tgt_padding_mask)
-                loss = criterion(logits.reshape(-1, logits.shape[-1]), tgt_output.reshape(-1))
+                logits = model(input_tokens, mask=causal_mask, padding_mask=padding_mask)
+                loss = criterion(logits.reshape(-1, logits.shape[-1]), target_tokens.reshape(-1))
                 loss.backward()
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0).item()
                 optimizer.step()
