@@ -10,8 +10,8 @@ model:
 # Training Schedule
 training:
   epochs: 10000
-  batch_size: 4
-  gradient_accumulation_steps: 32  # Effective batch = batch_size * gradient_accumulation_steps
+  batch_size: 8
+  gradient_accumulation_steps: 16  # Effective batch = batch_size * gradient_accumulation_steps
   lr: 1e-4
   device: "auto"
   use_torch_compile: true  # torch.compile for 20-40% speedup
@@ -23,7 +23,7 @@ dataset:
 
 # Validation & Execution
 validation:
-  interval_epochs: 50      # Run validation every N epochs
+  interval_epochs: 250      # Run validation every N epochs
   num_examples: 64        # Total examples to generate, execute & score for validation
   max_gen_len: 2048         # Maximum tokens to generate per example
 
