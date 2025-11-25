@@ -1,6 +1,7 @@
 import torch
 from torch.utils.data import Dataset
 import generators
+import verifiers
 import inspect
 import re
 import ast
@@ -45,6 +46,11 @@ class ARCDataset(Dataset):
                 codes[task_id] = '\n'.join(body_lines)
         return codes
 
+    def _grid_exceeds_size(self, grid, max_dim=30):
+        if not grid:
+            return False
+        return len(grid) > max_dim or any(len(row) > max_dim for row in grid)
+
     def __len__(self):
         return len(self.tasks)
 
@@ -53,12 +59,24 @@ class ARCDataset(Dataset):
         task_id = self.tasks[idx]
         
         generator = getattr(generators, f'generate_{task_id}')
+        verifier = getattr(verifiers, f'verify_{task_id}', None)
+        if verifier is None:
+            return self.__getitem__((idx + 1) % len(self))
         
-        for _ in range(5):
+        for attempt in range(5):
             try:
                 example = generator(self.diff_lb, self.diff_ub)
                 input_grid = example['input']
                 output_grid = example['output']
+                if self._grid_exceeds_size(input_grid) or self._grid_exceeds_size(output_grid):
+                    print(f"[Dataset] Skipping task {task_id}: grid exceeds {30}x{30} (attempt {attempt+1}/5)")
+                    continue
+                if input_grid == output_grid:
+                    print(f"[Dataset] Skipping task {task_id}: input matches output (attempt {attempt+1}/5)")
+                    continue
+                if verifier(input_grid) != output_grid:
+                    print(f"[Dataset] Verifier mismatch for task {task_id} (attempt {attempt+1}/5)")
+                    continue
                 break
             except Exception:
                 continue

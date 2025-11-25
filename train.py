@@ -187,6 +187,17 @@ class DecoderLayer(nn.Module):
         return x, present
 
 
+def clean_state_dict(state_dict):
+    prefixes = ['_orig_mod.', 'module.']
+    cleaned = dict(state_dict)
+    for prefix in prefixes:
+        cleaned = {
+            (key[len(prefix):] if key.startswith(prefix) else key): value
+            for key, value in cleaned.items()
+        }
+    return cleaned
+
+
 def create_arc_dataset(cfg):
     return ARCDataset(
         diff_lb=cfg['dataset']['diff_lb'],
@@ -536,7 +547,8 @@ def train():
     if args.resume:
         print(f"Loading checkpoint from {args.resume}")
         checkpoint = torch.load(args.resume, map_location=DEVICE)
-        model.load_state_dict(checkpoint['model_state_dict'])
+        state_dict = clean_state_dict(checkpoint['model_state_dict'])
+        model.load_state_dict(state_dict)
         optimizer_state = checkpoint.get('optimizer_state_dict', None)
         start_epoch = checkpoint.get('epoch', 0)
         global_step = checkpoint.get('global_step', 0)
