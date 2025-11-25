@@ -10,7 +10,8 @@ model:
 # Training Schedule
 training:
   epochs: 10
-  batch_size: 4
+  batch_size: 1
+  gradient_accumulation_steps: 64  # Effective batch = batch_size * gradient_accumulation_steps
   lr: 1e-4
   device: "auto"
   use_torch_compile: false  # torch.compile for 20-40% speedup (disable on Mac)

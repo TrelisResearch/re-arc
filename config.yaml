@@ -3,14 +3,15 @@ model:
   vocab_size: 384  # 6 special + DSL constants (ZERO-NINE for colors) + verifier tokens
   d_model: 256
   n_head: 8
-  num_layers: 16        # Number of decoder layers (GPT-style decoder-only)
-  num_recursions: 1     # Number of times to recursively apply the decoder stack
+  num_layers: 1        # Number of decoder layers (GPT-style decoder-only)
+  num_recursions: 16     # Number of times to recursively apply the decoder stack
   dropout: 0.1
 
 # Training Schedule
 training:
   epochs: 10000
-  batch_size: 64
+  batch_size: 32
+  gradient_accumulation_steps: 4  # Effective batch = batch_size * gradient_accumulation_steps
   lr: 1.0e-4
   device: "auto"
   use_torch_compile: true  # torch.compile for 20-40% speedup
@@ -18,7 +19,7 @@ training:
 # Dataset
 dataset:
   diff_lb: 0.0  # Difficulty lower bound
-  diff_ub: 0.5  # Difficulty upper bound
+  diff_ub: 1  # Difficulty upper bound
 
 # Validation & Execution
 validation:

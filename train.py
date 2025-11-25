@@ -423,10 +423,16 @@ def train():
 
     print(f"Model Parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
 
+    # Gradient accumulation
+    gradient_accumulation_steps = cfg['training'].get('gradient_accumulation_steps', 1)
+    effective_batch_size = cfg['training']['batch_size'] * gradient_accumulation_steps
+    print(f"Batch size: {cfg['training']['batch_size']}, Accumulation steps: {gradient_accumulation_steps}")
+    print(f"Effective batch size: {effective_batch_size}")
+
     save_dir = cfg['checkpoint']['save_dir']
     os.makedirs(save_dir, exist_ok=True)
     best_val_correct = 0.0
-    global_step = 0 # To track total batches for WandB
+    global_step = 0 # To track total optimizer steps for WandB
     start_epoch = 0
 
     # Resume from checkpoint if specified
@@ -444,6 +450,7 @@ def train():
     model.train()
     for epoch in range(start_epoch, cfg['training']['epochs']):
         total_loss = 0
+        optimizer.zero_grad()  # Zero gradients at start of epoch
 
         pbar = tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Epoch {epoch+1}/{cfg['training']['epochs']}")
         for batch_idx, (src, tgt) in pbar:
@@ -465,35 +472,43 @@ def train():
             causal_mask = generate_square_subsequent_mask(seq_len).to(DEVICE)
             padding_mask = (input_tokens == tokenizer.pad_token_id)
 
-            optimizer.zero_grad()
-
             # Mixed precision forward pass (BF16 doesn't need GradScaler)
             if use_amp:
                 with torch.amp.autocast('cuda', dtype=amp_dtype):
                     logits = model(input_tokens, mask=causal_mask, padding_mask=padding_mask)
                     loss = criterion(logits.reshape(-1, logits.shape[-1]), target_tokens.reshape(-1))
+                    # Scale loss by accumulation steps for correct gradient magnitude
+                    loss = loss / gradient_accumulation_steps
                 loss.backward()
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0).item()
-                optimizer.step()
             else:
                 logits = model(input_tokens, mask=causal_mask, padding_mask=padding_mask)
                 loss = criterion(logits.reshape(-1, logits.shape[-1]), target_tokens.reshape(-1))
+                # Scale loss by accumulation steps for correct gradient magnitude
+                loss = loss / gradient_accumulation_steps
                 loss.backward()
+
+            # Accumulate the unscaled loss for logging
+            total_loss += loss.item() * gradient_accumulation_steps
+
+            # Only update weights every gradient_accumulation_steps
+            if (batch_idx + 1) % gradient_accumulation_steps == 0:
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0).item()
                 optimizer.step()
+                optimizer.zero_grad()
+                global_step += 1
 
-            total_loss += loss.item()
-            global_step += 1
+                # Update progress bar (show actual loss, not scaled)
+                pbar.set_postfix({'loss': f'{loss.item() * gradient_accumulation_steps:.4f}', 'grad_norm': f'{grad_norm:.4f}'})
 
-            # Update progress bar
-            pbar.set_postfix({'loss': f'{loss.item():.4f}', 'grad_norm': f'{grad_norm:.4f}'})
-
-            if use_wandb:
-                wandb.log({
-                    "train/loss": loss.item(),
-                    "train/grad_norm": grad_norm,
-                    "_step": global_step
-                })
+                if use_wandb:
+                    wandb.log({
+                        "train/loss": loss.item() * gradient_accumulation_steps,
+                        "train/grad_norm": grad_norm,
+                        "_step": global_step
+                    })
+            else:
+                # Just show loss without grad_norm during accumulation
+                pbar.set_postfix({'loss': f'{loss.item() * gradient_accumulation_steps:.4f}', 'accumulating': f'{(batch_idx + 1) % gradient_accumulation_steps}/{gradient_accumulation_steps}'})
 
         pbar.close()
         avg_loss = total_loss / (batch_idx + 1) if (batch_idx + 1) else 0
