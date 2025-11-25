@@ -1,7 +1,7 @@
 # Model Architecture
 model:
   vocab_size: 384  # 6 special + DSL constants (ZERO-NINE for colors) + verifier tokens
-  d_model: 256
+  d_model: 512
   n_head: 8
   num_layers: 1        # Number of decoder layers (GPT-style decoder-only)
   num_recursions: 16     # Number of times to recursively apply the decoder stack
@@ -10,9 +10,9 @@ model:
 # Training Schedule
 training:
   epochs: 10000
-  batch_size: 16
-  gradient_accumulation_steps: 4  # Effective batch = batch_size * gradient_accumulation_steps
-  lr: 1.0e-4
+  batch_size: 4
+  gradient_accumulation_steps: 32  # Effective batch = batch_size * gradient_accumulation_steps
+  lr: 5e-5
   device: "auto"
   use_torch_compile: true  # torch.compile for 20-40% speedup
 
