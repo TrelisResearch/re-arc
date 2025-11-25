@@ -185,6 +185,89 @@ class DecoderLayer(nn.Module):
 
         return x, present
 
+
+def _strip_state_dict_prefix(state_dict, prefix):
+    return {
+        (key[len(prefix):] if key.startswith(prefix) else key): value
+        for key, value in state_dict.items()
+    }
+
+
+def _convert_old_decoder_state_dict(state_dict, model):
+    new_state = model.state_dict()
+
+    # Ensure positional encoding shape matches
+    if 'pos_encoder.pe' in state_dict:
+        pe = state_dict['pos_encoder.pe']
+        if pe.dim() == 3 and pe.size(1) == 1:
+            pe = pe.squeeze(1)
+        new_state['pos_encoder.pe'] = pe
+
+    # Copy embedding/head weights if present
+    for key in ['embedding.weight', 'fc_out.weight', 'fc_out.bias']:
+        if key in state_dict:
+            new_state[key] = state_dict[key]
+
+    num_layers = model.num_layers
+    for layer_idx in range(num_layers):
+        old_prefix = f"decoder.layers.{layer_idx}."
+        new_prefix = f"layers.{layer_idx}."
+
+        qkv_w = state_dict.get(old_prefix + "self_attn.in_proj_weight")
+        qkv_b = state_dict.get(old_prefix + "self_attn.in_proj_bias")
+        if qkv_w is not None:
+            q_w, k_w, v_w = torch.chunk(qkv_w, 3, dim=0)
+            new_state[new_prefix + "self_attn.q_proj.weight"] = q_w
+            new_state[new_prefix + "self_attn.k_proj.weight"] = k_w
+            new_state[new_prefix + "self_attn.v_proj.weight"] = v_w
+        if qkv_b is not None:
+            q_b, k_b, v_b = torch.chunk(qkv_b, 3, dim=0)
+            new_state[new_prefix + "self_attn.q_proj.bias"] = q_b
+            new_state[new_prefix + "self_attn.k_proj.bias"] = k_b
+            new_state[new_prefix + "self_attn.v_proj.bias"] = v_b
+
+        for name in ["self_attn.out_proj.weight", "self_attn.out_proj.bias",
+                     "linear1.weight", "linear1.bias",
+                     "linear2.weight", "linear2.bias"]:
+            old_key = old_prefix + name
+            new_key = new_prefix + name
+            if old_key in state_dict:
+                new_state[new_key] = state_dict[old_key]
+
+        # Map old norm1 -> new norm1, old norm3 -> new norm2 (skip old norm2)
+        for old_name, new_name in [("norm1.weight", "norm1.weight"),
+                                   ("norm1.bias", "norm1.bias"),
+                                   ("norm3.weight", "norm2.weight"),
+                                   ("norm3.bias", "norm2.bias")]:
+            old_key = old_prefix + old_name
+            new_key = new_prefix + new_name
+            if old_key in state_dict:
+                new_state[new_key] = state_dict[old_key]
+
+    return new_state
+
+
+def prepare_state_dict_for_loading(state_dict, model):
+    cleaned_state = state_dict
+    for prefix in ['_orig_mod.', 'module.']:
+        cleaned_state = _strip_state_dict_prefix(cleaned_state, prefix)
+
+    if 'pos_encoder.pe' in cleaned_state:
+        pe = cleaned_state['pos_encoder.pe']
+        if pe.dim() == 3 and pe.size(1) == 1:
+            cleaned_state = dict(cleaned_state)
+            cleaned_state['pos_encoder.pe'] = pe.squeeze(1)
+
+    if any(key.startswith('decoder.layers.') for key in cleaned_state.keys()):
+        return _convert_old_decoder_state_dict(cleaned_state, model)
+
+    # Already new-style; merge into current state dict to ensure all keys exist
+    new_state = model.state_dict()
+    for key, value in cleaned_state.items():
+        if key in new_state:
+            new_state[key] = value
+    return new_state
+
 def generate_square_subsequent_mask(sz):
     """Generate causal mask for autoregressive decoding (boolean version for PyTorch 2.0+)"""
     mask = torch.triu(torch.ones(sz, sz, dtype=torch.bool), diagonal=1)
@@ -520,6 +603,25 @@ def train():
         dropout=cfg['model']['dropout']
     ).to(DEVICE)
 
+    save_dir = cfg['checkpoint']['save_dir']
+    os.makedirs(save_dir, exist_ok=True)
+    best_val_correct = 0.0
+    global_step = 0 # To track total optimizer steps for WandB
+    start_epoch = 0
+    optimizer_state = None
+
+    # Resume from checkpoint if specified
+    if args.resume:
+        print(f"Loading checkpoint from {args.resume}")
+        checkpoint = torch.load(args.resume, map_location=DEVICE)
+        prepared_state = prepare_state_dict_for_loading(checkpoint['model_state_dict'], model)
+        model.load_state_dict(prepared_state)
+        optimizer_state = checkpoint.get('optimizer_state_dict', None)
+        start_epoch = checkpoint.get('epoch', 0)
+        global_step = checkpoint.get('global_step', 0)
+        best_val_correct = checkpoint.get('best_val_correct', 0.0)
+        print(f"Resumed from epoch {start_epoch}, global_step {global_step}")
+
     # Compile model for speedup (PyTorch 2.0+)
     if hasattr(torch, 'compile') and cfg.get('training', {}).get('use_torch_compile', False):
         try:
@@ -531,6 +633,8 @@ def train():
             print("Continuing without compilation...")
 
     optimizer = optim.Adam(model.parameters(), lr=float(cfg['training']['lr']))
+    if optimizer_state:
+        optimizer.load_state_dict(optimizer_state)
     criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
 
     # Mixed precision training (BF16 on CUDA for better stability on Ampere/Hopper)
@@ -546,24 +650,6 @@ def train():
     effective_batch_size = cfg['training']['batch_size'] * gradient_accumulation_steps
     print(f"Batch size: {cfg['training']['batch_size']}, Accumulation steps: {gradient_accumulation_steps}")
     print(f"Effective batch size: {effective_batch_size}")
-
-    save_dir = cfg['checkpoint']['save_dir']
-    os.makedirs(save_dir, exist_ok=True)
-    best_val_correct = 0.0
-    global_step = 0 # To track total optimizer steps for WandB
-    start_epoch = 0
-
-    # Resume from checkpoint if specified
-    if args.resume:
-        print(f"Loading checkpoint from {args.resume}")
-        checkpoint = torch.load(args.resume, map_location=DEVICE)
-
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        start_epoch = checkpoint.get('epoch', 0)
-        global_step = checkpoint.get('global_step', 0)
-        best_val_correct = checkpoint.get('best_val_correct', 0.0)
-        print(f"Resumed from epoch {start_epoch}, global_step {global_step}")
 
     model.train()
     for epoch in range(start_epoch, cfg['training']['epochs']):
