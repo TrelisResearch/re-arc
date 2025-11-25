@@ -28,45 +28,56 @@ class DecoderOnlyDSLTransformer(nn.Module):
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.pos_encoder = PositionalEncoding(d_model, dropout)
 
-        # Build decoder stack
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=d_model,
-            nhead=n_head,
-            dim_feedforward=d_model * 4,  # Standard 4x expansion
-            dropout=dropout,
-            batch_first=True
-        )
-        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
-
+        self.layers = nn.ModuleList([
+            DecoderLayer(d_model, n_head, dropout) for _ in range(num_layers)
+        ])
+        self.final_norm = nn.LayerNorm(d_model)
         self.fc_out = nn.Linear(d_model, vocab_size)
 
-    def forward(self, tokens, mask=None, padding_mask=None):
+    def forward(self, tokens, mask=None, padding_mask=None, past_key_values=None, use_cache=False, position_ids=None):
         """
         Decoder-only forward pass (GPT-style) with optional recursion.
         Args:
             tokens: [batch, seq_len] token IDs
             mask: [seq_len, seq_len] causal attention mask
             padding_mask: [batch, seq_len] padding mask
+            past_key_values: list of cached (k, v) tuples
+            use_cache: whether to return cache for generation
+            position_ids: absolute position indices for tokens
         Returns:
             logits: [batch, seq_len, vocab_size]
         """
         # Embed and add positions
-        x = self.pos_encoder(self.embedding(tokens))
+        x = self.embedding(tokens)
+        x = self.pos_encoder(x, position_ids=position_ids)
 
-        # Apply decoder stack recursively for self-refinement
-        # When num_recursions=1, this is standard GPT-style
-        # When num_recursions>1, we recursively refine representations
+        total_layers = self.num_layers * self.num_recursions
+        if past_key_values is None:
+            past_key_values = [None] * total_layers
+
+        presents = [] if use_cache else None
+        layer_offset = 0
+
         for _ in range(self.num_recursions):
-            # In decoder-only, we pass the same input as both tgt and memory
-            x = self.decoder(
-                tgt=x,
-                memory=x,
-                tgt_mask=mask,
-                tgt_key_padding_mask=padding_mask,
-                memory_key_padding_mask=padding_mask
-            )
+            for layer_idx, layer in enumerate(self.layers):
+                cache_idx = layer_offset + layer_idx
+                past = past_key_values[cache_idx] if cache_idx < len(past_key_values) else None
+                x, present = layer(
+                    x,
+                    attn_mask=mask,
+                    key_padding_mask=padding_mask,
+                    past_key_value=past,
+                    use_cache=use_cache
+                )
+                if use_cache:
+                    presents.append(present)
+            layer_offset += self.num_layers
 
-        return self.fc_out(x)
+        x = self.final_norm(x)
+        logits = self.fc_out(x)
+        if use_cache:
+            return logits, presents
+        return logits
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, dropout=0.1, max_len=5000):
@@ -75,14 +86,104 @@ class PositionalEncoding(nn.Module):
 
         position = torch.arange(max_len).unsqueeze(1)
         div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
-        pe = torch.zeros(max_len, 1, d_model)
-        pe[:, 0, 0::2] = torch.sin(position * div_term)
-        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        pe = torch.zeros(max_len, d_model)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
         self.register_buffer('pe', pe)
 
-    def forward(self, x):
-        x = x + self.pe[:x.size(1), :].transpose(0, 1)
+    def forward(self, x, position_ids=None):
+        if position_ids is None:
+            position_ids = torch.arange(x.size(1), device=x.device).unsqueeze(0)
+        position_ids = position_ids.clamp(0, self.pe.size(0) - 1)
+        pe = self.pe[position_ids]
+        x = x + pe
         return self.dropout(x)
+
+
+class MultiHeadSelfAttention(nn.Module):
+    def __init__(self, d_model, n_head, dropout):
+        super().__init__()
+        assert d_model % n_head == 0, "d_model must be divisible by n_head"
+        self.n_head = n_head
+        self.head_dim = d_model // n_head
+
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, attn_mask=None, key_padding_mask=None, past_key_value=None, use_cache=False):
+        batch_size, seq_len, _ = x.size()
+
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        q = q.view(batch_size, seq_len, self.n_head, self.head_dim).transpose(1, 2)
+        k = k.view(batch_size, seq_len, self.n_head, self.head_dim).transpose(1, 2)
+        v = v.view(batch_size, seq_len, self.n_head, self.head_dim).transpose(1, 2)
+
+        if past_key_value is not None:
+            past_k, past_v = past_key_value
+            k = torch.cat([past_k, k], dim=2)
+            v = torch.cat([past_v, v], dim=2)
+
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+        if attn_mask is not None:
+            if attn_mask.dim() == 2:
+                attn_mask_ = attn_mask.unsqueeze(0).unsqueeze(0)
+            elif attn_mask.dim() == 3:
+                attn_mask_ = attn_mask.unsqueeze(1)
+            else:
+                raise ValueError("Unsupported attn_mask dimension")
+            attn_scores = attn_scores.masked_fill(attn_mask_, float('-inf'))
+
+        if key_padding_mask is not None:
+            padding_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
+            attn_scores = attn_scores.masked_fill(padding_mask, float('-inf'))
+
+        attn_weights = torch.softmax(attn_scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+
+        attn_output = torch.matmul(attn_weights, v)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+        attn_output = self.out_proj(attn_output)
+
+        present = (k, v) if use_cache else None
+        return attn_output, present
+
+
+class DecoderLayer(nn.Module):
+    def __init__(self, d_model, n_head, dropout):
+        super().__init__()
+        self.self_attn = MultiHeadSelfAttention(d_model, n_head, dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.linear1 = nn.Linear(d_model, d_model * 4)
+        self.linear2 = nn.Linear(d_model * 4, d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.activation = nn.GELU()
+
+    def forward(self, x, attn_mask=None, key_padding_mask=None, past_key_value=None, use_cache=False):
+        residual = x
+        normed = self.norm1(x)
+        attn_output, present = self.self_attn(
+            normed,
+            attn_mask=attn_mask,
+            key_padding_mask=key_padding_mask,
+            past_key_value=past_key_value,
+            use_cache=use_cache
+        )
+        x = residual + self.dropout(attn_output)
+
+        residual = x
+        normed = self.norm2(x)
+        ff_output = self.linear2(self.activation(self.linear1(normed)))
+        x = residual + self.dropout(ff_output)
+
+        return x, present
 
 def generate_square_subsequent_mask(sz):
     """Generate causal mask for autoregressive decoding (boolean version for PyTorch 2.0+)"""
@@ -159,42 +260,59 @@ def run_generation_batch(model, src_batch, tokenizer, device, max_len):
     batch_size = src_batch.size(0)
 
     with torch.no_grad():
-        # Start with src (which contains: [BOS] input_grid [SEP] output_grid [SEP])
-        # We'll autoregressively generate the code tokens after the second [SEP]
         curr_tokens = src_batch.to(device)
+        past_key_values = None
+        generated = [[] for _ in range(batch_size)]
         finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
         for _ in range(max_len):
-            seq_len = curr_tokens.size(1)
-            causal_mask = generate_square_subsequent_mask(seq_len).to(device)
-            padding_mask = (curr_tokens == tokenizer.pad_token_id)
+            if past_key_values is None:
+                seq_len = curr_tokens.size(1)
+                causal_mask = generate_square_subsequent_mask(seq_len).to(device)
+                padding_mask = (curr_tokens == tokenizer.pad_token_id)
+                logits, past_key_values = model(
+                    curr_tokens,
+                    mask=causal_mask,
+                    padding_mask=padding_mask,
+                    use_cache=True
+                )
+            else:
+                past_seq_len = past_key_values[0][0].size(2)
+                position_ids = torch.full(
+                    (batch_size, curr_tokens.size(1)),
+                    past_seq_len,
+                    dtype=torch.long,
+                    device=device
+                )
+                logits, past_key_values = model(
+                    curr_tokens,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    position_ids=position_ids
+                )
 
-            # Forward pass through decoder-only model
-            logits = model(curr_tokens, mask=causal_mask, padding_mask=padding_mask)
-
-            # Get next token predictions (last position)
             next_tokens = torch.argmax(logits[:, -1, :], dim=-1)
+            next_tokens = torch.where(
+                finished,
+                torch.full_like(next_tokens, tokenizer.eos_token_id),
+                next_tokens
+            )
 
-            # Check for EOS
-            finished |= (next_tokens == tokenizer.eos_token_id)
+            for i in range(batch_size):
+                if finished[i]:
+                    continue
+                token_id = next_tokens[i].item()
+                if token_id == tokenizer.eos_token_id:
+                    finished[i] = True
+                else:
+                    generated[i].append(token_id)
+
             if finished.all():
                 break
 
-            # Append next tokens
-            curr_tokens = torch.cat([curr_tokens, next_tokens.unsqueeze(1)], dim=1)
+            curr_tokens = next_tokens.unsqueeze(1)
 
-        # Decode each sequence - extract only the generated code part (after src)
-        results = []
-        src_len = src_batch.size(1)
-        for i in range(batch_size):
-            # Get tokens generated after the source prompt
-            generated_tokens = curr_tokens[i, src_len:].cpu().tolist()
-
-            # Stop at EOS
-            if tokenizer.eos_token_id in generated_tokens:
-                generated_tokens = generated_tokens[:generated_tokens.index(tokenizer.eos_token_id)]
-
-            results.append(tokenizer.decode(generated_tokens))
+        results = [tokenizer.decode(tokens) for tokens in generated]
 
     model.train()
     return results
