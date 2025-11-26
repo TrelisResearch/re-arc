@@ -9,12 +9,13 @@ model:
 
 # Training Schedule
 training:
-  epochs: 10000
+  epochs: 20000
   batch_size: 8
   gradient_accumulation_steps: 16  # Effective batch = batch_size * gradient_accumulation_steps
   lr: 1e-4
   device: "auto"
   use_torch_compile: true  # torch.compile for 20-40% speedup
+  num_workers: 4  # Disable multiprocessing workers to avoid silent crashes
 
 # Dataset
 dataset:
