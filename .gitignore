@@ -1,6 +1,7 @@
 re_arc/tasks/*
 .DS_Store
 *.json
+!data/*.json
 !re_arc/metadata.json
 
 # Python
