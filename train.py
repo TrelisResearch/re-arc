@@ -252,9 +252,13 @@ def reconstruct_grid_from_tokens(token_ids, tokenizer):
     return tuple(grid)
 
 def execute_and_score(generated_code, input_grid, target_grid):
+    MAX_CODE_CHARS = 20000
+    if len(generated_code) > MAX_CODE_CHARS:
+        return False, False, False
+
     try:
         ast.parse(generated_code)
-    except SyntaxError:
+    except (SyntaxError, MemoryError):
         return False, False, False
 
     if 'return' not in generated_code:
@@ -275,6 +279,8 @@ def execute_and_score(generated_code, input_grid, target_grid):
             return True, True, True
         else:
             return True, True, False
+    except MemoryError:
+        return True, False, False
     except Exception:
         return True, False, False
 

@@ -26,7 +26,6 @@
 - [ ] **Search Strategy**: Implement Beam Search or Temperature Sampling.
 
 ## Performance Notes
-20k model on AA1 eval (naive): 
-20k model on AA1 eval (naive + beam search of 8): 
-- Beam pre-checks w/ beam of 8: 3.5%
-- 
+20k model on AA1 eval (naive): 3.5%
++ constrained de-coding: 
++ beam search: ...
