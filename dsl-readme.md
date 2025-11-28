@@ -11,6 +11,32 @@
     - **% Runtime Success**: Runs without crashing.
     - **% Solved**: Produces exact target grid.
 
+Last work:
+- Added in guided decoding but score is now down at 2.4$ instead of what was 3.5%. Syntax valid is now 97.4%, which isn't higher than without guidance...
+
+============================================================
+EVALUATION RESULTS (eval mode)
+============================================================
+Total tasks:     400
+Tasks solved:      14 /  400 (3.5%)
+Total examples:  419
+Syntax valid:     409 /  419 (97.6%)
+Runtime success:  295 /  419 (70.4%)
+Correct:           14 /  419 (3.3%)
+============================================================
+
+and with guidance:
+============================================================
+EVALUATION RESULTS (eval mode)
+============================================================
+Total tasks:     400
+Tasks solved:      10 /  400 (2.5%)
+Total examples:  419
+Syntax valid:     408 /  419 (97.4%)
+Runtime success:  279 /  419 (66.6%)
+Correct:           10 /  419 (2.4%)
+============================================================
+
 ## TODO
 - [x] **Review code overall**
     - [x] Review tokenizer
@@ -28,4 +54,4 @@
 ## Performance Notes
 20k model on AA1 eval (naive): 3.5%
 + constrained de-coding: 
-+ beam search: ...
++ beam search: 2.4% (doesn't make a lot of sense)...
