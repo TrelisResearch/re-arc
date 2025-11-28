@@ -40,6 +40,9 @@ uv run evaluate.py --checkpoint checkpoints/model.pt --mode eval --beam-width 10
 # Quick sanity check on 10 evaluation tasks
 uv run evaluate.py --checkpoint checkpoints/model.pt --mode eval --num-tasks 10
 
+# Enforce basic DSL syntax during decoding
+uv run evaluate.py --checkpoint checkpoints/model.pt --mode eval --constrained-decoding
+
 # Use training set instead (challenges + solutions)
 uv run evaluate.py --checkpoint checkpoints/model.pt --mode eval \
   --challenges data/arc-agi_training_challenges.json \
@@ -88,6 +91,15 @@ python evaluate.py --checkpoint model.pt --mode eval --beam-width 10
   - K=5: Fast, moderate improvement
   - K=10: Sweet spot for most cases
   - K=20: High accuracy, diminishing returns
+
+### Constrained Decoding
+```bash
+python evaluate.py --checkpoint model.pt --mode eval --constrained-decoding
+```
+- Masks logits with a lightweight DSL grammar (assignment, parentheses, commas, returns)
+- Prevents clearly invalid tokens (e.g., stray `=` or unmatched `)`) before execution
+- Works with both greedy and beam search; combine with `--beam-width` for best results
+- Keeps evaluation aligned with how training data is structured (one statement per line)
 
 ## Entropy Measurement
 

@@ -36,6 +36,7 @@ from dataset import ARCDataset
 import generators
 import verifiers
 import dsl
+from utils import DSLConstrainedDecoder
 
 
 def get_device():
@@ -85,9 +86,11 @@ def load_model(checkpoint_path, device):
     return model, tokenizer
 
 
-def greedy_generate(model, src_tokens, tokenizer, device, max_len=2048):
+def greedy_generate(model, src_tokens, tokenizer, device, max_len=2048,
+                    constraint: DSLConstrainedDecoder = None):
     """Greedy decoding (existing method)."""
     model.eval()
+    constraint_state = constraint.new_state() if constraint else None
 
     with torch.no_grad():
         curr_tokens = src_tokens.unsqueeze(0).to(device)
@@ -120,39 +123,47 @@ def greedy_generate(model, src_tokens, tokenizer, device, max_len=2048):
                     position_ids=position_ids
                 )
 
-            next_token = torch.argmax(logits[:, -1, :], dim=-1)
+            step_logits = logits[:, -1, :]
+            if constraint_state and constraint:
+                step_logits = constraint.apply(step_logits, constraint_state)
+
+            next_token = torch.argmax(step_logits, dim=-1)
 
             if next_token.item() == tokenizer.eos_token_id:
                 break
 
             generated.append(next_token.item())
             curr_tokens = next_token.unsqueeze(1)  # [batch] -> [batch, 1]
+            if constraint_state:
+                constraint_state.update(next_token.item())
 
         return tokenizer.decode(generated)
 
 
-def beam_search_generate(model, src_tokens, tokenizer, device, beam_width=10, max_len=2048):
+def beam_search_generate(model, src_tokens, tokenizer, device, beam_width=10, max_len=2048,
+                         constraint: DSLConstrainedDecoder = None):
     """
     Beam search decoding.
 
     Returns list of (decoded_string, log_probability) tuples, sorted by probability.
     """
     model.eval()
+    base_state = constraint.new_state() if constraint else None
 
     with torch.no_grad():
         # Initialize beam: (prefix_tokens, log_prob, past_kv, finished)
         src_batch = src_tokens.unsqueeze(0).to(device)
-        beams = [(src_batch, 0.0, None, False)]
+        beams = [(src_batch, 0.0, None, False, base_state)]
 
         for step in range(max_len):
-            if all(finished for _, _, _, finished in beams):
+            if all(finished for *_, finished in beams):
                 break
 
             candidates = []
 
-            for prefix, log_prob, past_kv, finished in beams:
+            for prefix, log_prob, past_kv, finished, state in beams:
                 if finished:
-                    candidates.append((prefix, log_prob, past_kv, True))
+                    candidates.append((prefix, log_prob, past_kv, True, state.copy() if state else None))
                     continue
 
                 # Forward pass
@@ -182,7 +193,10 @@ def beam_search_generate(model, src_tokens, tokenizer, device, beam_width=10, ma
                     )
 
                 # Get top-K tokens (fixing for beam search too)
-                log_probs = F.log_softmax(logits[0, -1, :], dim=-1)
+                step_logits = logits[0, -1, :]
+                if constraint and state:
+                    step_logits = constraint.apply(step_logits, state)
+                log_probs = F.log_softmax(step_logits, dim=-1)
                 top_log_probs, top_indices = torch.topk(log_probs, k=beam_width)
 
                 for token_log_prob, token_id in zip(top_log_probs, top_indices):
@@ -190,15 +204,18 @@ def beam_search_generate(model, src_tokens, tokenizer, device, beam_width=10, ma
                     new_prefix = torch.cat([prefix, new_token], dim=1) if past_kv is None else new_token
                     new_log_prob = log_prob + token_log_prob.item()
                     is_finished = (token_id.item() == tokenizer.eos_token_id)
+                    new_state = state.copy() if state else None
+                    if new_state and not is_finished:
+                        new_state.update(token_id.item())
 
-                    candidates.append((new_prefix, new_log_prob, new_kv, is_finished))
+                    candidates.append((new_prefix, new_log_prob, new_kv, is_finished, new_state))
 
             # Keep top beam_width candidates
             beams = sorted(candidates, key=lambda x: x[1], reverse=True)[:beam_width]
 
         # Decode all beams
         results = []
-        for prefix, log_prob, _, _ in beams:
+        for prefix, log_prob, _, _, _ in beams:
             # Extract generated tokens (skip source prefix)
             gen_tokens = prefix[0, src_tokens.size(0):].cpu().tolist()
             decoded = tokenizer.decode(gen_tokens)
@@ -207,7 +224,8 @@ def beam_search_generate(model, src_tokens, tokenizer, device, beam_width=10, ma
         return results
 
 
-def measure_entropy(model, src_tokens, tokenizer, device, num_steps=10):
+def measure_entropy(model, src_tokens, tokenizer, device, num_steps=10,
+                    constraint: DSLConstrainedDecoder = None):
     """
     Measure average per-token entropy during generation.
 
@@ -217,6 +235,8 @@ def measure_entropy(model, src_tokens, tokenizer, device, num_steps=10):
     """
     model.eval()
     entropies = []
+
+    constraint_state = constraint.new_state() if constraint else None
 
     with torch.no_grad():
         curr_tokens = src_tokens.unsqueeze(0).to(device)
@@ -249,16 +269,22 @@ def measure_entropy(model, src_tokens, tokenizer, device, num_steps=10):
                 )
 
             # Compute entropy: H = -sum(p * log(p))
-            probs = F.softmax(logits[0, -1, :], dim=-1)
+            step_logits = logits[0, -1, :]
+            if constraint_state and constraint:
+                step_logits = constraint.apply(step_logits, constraint_state)
+
+            probs = F.softmax(step_logits, dim=-1)
             entropy = -torch.sum(probs * torch.log(probs + 1e-10)).item()
             entropies.append(entropy)
 
             # Sample next token for continued generation
-            next_token = torch.argmax(logits[:, -1, :], dim=-1)
+            next_token = torch.argmax(step_logits, dim=-1)
             if next_token.item() == tokenizer.eos_token_id:
                 break
 
             curr_tokens = next_token.unsqueeze(1)  # [batch] -> [batch, 1]
+            if constraint_state:
+                constraint_state.update(next_token.item())
 
     avg_entropy = np.mean(entropies) if entropies else 0.0
     max_entropy = np.log(tokenizer.vocab_size)
@@ -268,7 +294,8 @@ def measure_entropy(model, src_tokens, tokenizer, device, num_steps=10):
 
 
 def evaluate_on_training_tasks(model, tokenizer, device, num_tasks=400,
-                               beam_width=None, measure_entropy_flag=False):
+                               beam_width=None, measure_entropy_flag=False,
+                               constraint: DSLConstrainedDecoder = None):
     """Evaluate on synthetic training tasks."""
     dataset = ARCDataset(diff_lb=0.0, diff_ub=0.5)
 
@@ -323,7 +350,9 @@ def evaluate_on_training_tasks(model, tokenizer, device, num_tasks=400,
 
         # Measure entropy if requested
         if measure_entropy_flag and len(results['entropy_samples']) < 20:
-            avg_ent, norm_ent = measure_entropy(model, src_tensor, tokenizer, device)
+            avg_ent, norm_ent = measure_entropy(
+                model, src_tensor, tokenizer, device, constraint=constraint
+            )
             results['entropy_samples'].append({
                 'task_id': task_id,
                 'avg_entropy': avg_ent,
@@ -332,7 +361,10 @@ def evaluate_on_training_tasks(model, tokenizer, device, num_tasks=400,
 
         # Generate
         if beam_width and beam_width > 1:
-            beam_results = beam_search_generate(model, src_tensor, tokenizer, device, beam_width)
+            beam_results = beam_search_generate(
+                model, src_tensor, tokenizer, device, beam_width,
+                constraint=constraint
+            )
             # Try each beam candidate
             for generated_code, log_prob in beam_results:
                 syntax_ok, runs_ok, correct = execute_and_score(generated_code, input_grid, output_grid)
@@ -352,7 +384,9 @@ def evaluate_on_training_tasks(model, tokenizer, device, num_tasks=400,
                     results['runtime_success'] += 1
                 results['total'] += 1
         else:
-            generated_code = greedy_generate(model, src_tensor, tokenizer, device)
+            generated_code = greedy_generate(
+                model, src_tensor, tokenizer, device, constraint=constraint
+            )
             syntax_ok, runs_ok, correct = execute_and_score(generated_code, input_grid, output_grid)
 
             if syntax_ok:
@@ -370,7 +404,8 @@ def evaluate_on_eval_tasks(model, tokenizer, device,
                            challenges_path='data/arc-agi_evaluation_challenges.json',
                            solutions_path='data/arc-agi_evaluation_solutions.json',
                            num_tasks=None, beam_width=None,
-                           measure_entropy_flag=False):
+                           measure_entropy_flag=False,
+                           constraint: DSLConstrainedDecoder = None):
     """Evaluate on real ARC test examples using challenges and solutions files."""
 
     # Load challenges and solutions
@@ -420,7 +455,9 @@ def evaluate_on_eval_tasks(model, tokenizer, device,
 
             # Measure entropy
             if measure_entropy_flag and len(results['entropy_samples']) < 20:
-                avg_ent, norm_ent = measure_entropy(model, src_tensor, tokenizer, device)
+                avg_ent, norm_ent = measure_entropy(
+                    model, src_tensor, tokenizer, device, constraint=constraint
+                )
                 results['entropy_samples'].append({
                     'task_id': task_id,
                     'avg_entropy': avg_ent,
@@ -429,7 +466,10 @@ def evaluate_on_eval_tasks(model, tokenizer, device,
 
             # Generate
             if beam_width and beam_width > 1:
-                beam_results = beam_search_generate(model, src_tensor, tokenizer, device, beam_width)
+                beam_results = beam_search_generate(
+                    model, src_tensor, tokenizer, device, beam_width,
+                    constraint=constraint
+                )
                 for generated_code, log_prob in beam_results:
                     syntax_ok, runs_ok, correct = execute_and_score(generated_code, input_grid, output_grid)
                     if correct:
@@ -446,7 +486,10 @@ def evaluate_on_eval_tasks(model, tokenizer, device,
                     if runs_ok:
                         results['runtime_success'] += 1
             else:
-                generated_code = greedy_generate(model, src_tensor, tokenizer, device)
+                generated_code = greedy_generate(
+                    model, src_tensor, tokenizer, device,
+                    constraint=constraint
+                )
                 syntax_ok, runs_ok, correct = execute_and_score(generated_code, input_grid, output_grid)
 
                 if syntax_ok:
@@ -529,6 +572,8 @@ def main():
                        help="Beam width for beam search (default: greedy decoding)")
     parser.add_argument("--measure-entropy", action="store_true",
                        help="Measure model entropy on sample of examples")
+    parser.add_argument("--constrained-decoding", action="store_true",
+                        help="Enable grammar-aware token masking during decoding")
     parser.add_argument("--device", type=str, default=None,
                        help="Device to use (auto-detects if not specified)")
     parser.add_argument("--max-gen-len", type=int, default=2048,
@@ -542,6 +587,7 @@ def main():
 
     # Load model
     model, tokenizer = load_model(args.checkpoint, device)
+    constraint = DSLConstrainedDecoder(tokenizer) if args.constrained_decoding else None
 
     # Evaluate
     if args.mode == 'train':
@@ -550,7 +596,8 @@ def main():
             model, tokenizer, device,
             num_tasks=num_tasks,
             beam_width=args.beam_width,
-            measure_entropy_flag=args.measure_entropy
+            measure_entropy_flag=args.measure_entropy,
+            constraint=constraint
         )
     else:
         results = evaluate_on_eval_tasks(
@@ -559,7 +606,8 @@ def main():
             solutions_path=args.solutions,
             num_tasks=args.num_tasks,
             beam_width=args.beam_width,
-            measure_entropy_flag=args.measure_entropy
+            measure_entropy_flag=args.measure_entropy,
+            constraint=constraint
         )
 
     # Print results
