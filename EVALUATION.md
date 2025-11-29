@@ -5,14 +5,8 @@
 ### 1. Download a model from Hugging Face
 
 ```bash
-# Just download
-python pull_from_hf.py username/re-arc-model --output ./models/my_model
-
 # Download specific checkpoint
-python pull_from_hf.py username/re-arc-model --checkpoint checkpoint_epoch_1000.pt
-
-# Download and load into memory to verify
-python pull_from_hf.py username/re-arc-model --checkpoint checkpoint_epoch_1000.pt --load
+uv run utils/pull_from_hf.py Trelis/re-arc-neuro-dsl-20ke --checkpoint model_epoch_20000.pt
 ```
 
 ### 2. Evaluate on training tasks

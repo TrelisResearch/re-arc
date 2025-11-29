@@ -288,11 +288,18 @@ class DSLConstrainedDecoder:
             if tok_id is not None and tok_id < self.vocab_size:
                 self.base_allowed[tok_id] = False
 
+        # Cache for device-local base_allowed to avoid repeated CPU->GPU transfers
+        self._base_allowed_cache = {}
+
     def new_state(self) -> DSLConstraintState:
         return DSLConstraintState(config=self)
 
     def build_mask(self, state: DSLConstraintState, device) -> torch.Tensor:
-        mask = self.base_allowed.clone().to(device)
+        # Use cached device-local tensor to avoid expensive CPU->GPU transfers
+        device_key = str(device)
+        if device_key not in self._base_allowed_cache:
+            self._base_allowed_cache[device_key] = self.base_allowed.to(device)
+        mask = self._base_allowed_cache[device_key].clone()
 
         # Line start: only assignments or return (plus EOS if program already complete)
         if state.line_start:
@@ -353,7 +360,15 @@ class DSLConstrainedDecoder:
 
         if not mask.any():
             # Fallback to base to avoid NaNs if constraints go empty
-            mask = self.base_allowed.clone().to(device)
+            print("WARNING: Empty mask fallback triggered!")
+            print(f"  State: line_start={state.line_start}, expect_assign={state.expect_assign}, "
+                  f"need_value={state.need_value}, paren_depth={state.paren_depth}, "
+                  f"last_token_type={state.last_token_type}, seen_content={state.seen_content}")
+            # Use cached device-local tensor
+            device_key = str(device)
+            if device_key not in self._base_allowed_cache:
+                self._base_allowed_cache[device_key] = self.base_allowed.to(device)
+            mask = self._base_allowed_cache[device_key].clone()
 
         return mask
 

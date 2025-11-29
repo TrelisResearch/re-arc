@@ -29,6 +29,7 @@ import json
 import numpy as np
 from tqdm import tqdm
 from collections import defaultdict
+import time
 
 from train import DecoderOnlyDSLTransformer, generate_square_subsequent_mask, execute_and_score
 from tokenizer import DSLTokenizer
@@ -87,17 +88,24 @@ def load_model(checkpoint_path, device):
 
 
 def greedy_generate(model, src_tokens, tokenizer, device, max_len=2048,
-                    constraint: DSLConstrainedDecoder = None):
+                    constraint: DSLConstrainedDecoder = None, debug=False):
     """Greedy decoding (existing method)."""
     model.eval()
     constraint_state = constraint.new_state() if constraint else None
+
+    start_time = time.time() if debug else None
 
     with torch.no_grad():
         curr_tokens = src_tokens.unsqueeze(0).to(device)
         past_key_values = None
         generated = []
 
-        for _ in range(max_len):
+        for step in range(max_len):
+            step_start = time.time() if debug and constraint else None
+
+            # Debug: Print progress every 50 tokens when constraint is enabled
+            if debug and constraint and step > 0 and step % 50 == 0:
+                print(f"  Step {step}: generated {len(generated)} tokens so far...")
             if past_key_values is None:
                 seq_len = curr_tokens.size(1)
                 causal_mask = generate_square_subsequent_mask(seq_len).to(device)
@@ -124,8 +132,29 @@ def greedy_generate(model, src_tokens, tokenizer, device, max_len=2048,
                 )
 
             step_logits = logits[:, -1, :]
+
+            # Debug: Check if model wants EOS but constraint blocks it
             if constraint_state and constraint:
+                original_logits = step_logits.clone()
+
+                # Profile constraint application
+                constraint_start = time.time() if debug else None
                 step_logits = constraint.apply(step_logits, constraint_state)
+                if constraint_start:
+                    constraint_time = time.time() - constraint_start
+                    if constraint_time > 0.5:
+                        print(f"  WARNING: Constraint.apply() at step {step} took {constraint_time:.2f}s!")
+                        print(f"    State: line_start={constraint_state.line_start}, paren_depth={constraint_state.paren_depth}")
+
+                # Check if EOS was the top choice before constraining
+                top_unconstrained = torch.argmax(original_logits, dim=-1)
+                if top_unconstrained.item() == tokenizer.eos_token_id:
+                    if step_logits[0, tokenizer.eos_token_id].item() == float('-inf'):
+                        print(f"WARNING: Model wants EOS at step {step} but constraint blocks it!")
+                        print(f"  State: line_start={constraint_state.line_start}, "
+                              f"paren_depth={constraint_state.paren_depth}, "
+                              f"need_value={constraint_state.need_value}, "
+                              f"can_terminate={constraint_state.can_terminate()}")
 
             next_token = torch.argmax(step_logits, dim=-1)
 
@@ -137,6 +166,27 @@ def greedy_generate(model, src_tokens, tokenizer, device, max_len=2048,
             if constraint_state:
                 constraint_state.update(next_token.item())
 
+            # Debug: Detect slow steps
+            if step_start and step > 0:
+                step_time = time.time() - step_start
+                if step_time > 0.5:  # Individual step taking >0.5s
+                    print(f"  WARNING: Step {step} took {step_time:.2f}s! (context_len={len(generated)+src_tokens.size(0)})")
+
+        # Debug: Check if we hit max_len
+        if len(generated) >= max_len - 1:
+            print(f"WARNING: Hit max_len ({max_len}) without generating EOS!")
+            if constraint_state:
+                print(f"  Final state: line_start={constraint_state.line_start}, "
+                      f"paren_depth={constraint_state.paren_depth}, "
+                      f"need_value={constraint_state.need_value}, "
+                      f"can_terminate={constraint_state.can_terminate()}")
+            print(f"  Generated tokens: {len(generated)}")
+
+        if debug and start_time:
+            elapsed = time.time() - start_time
+            if elapsed > 2.0:  # Only report slow generations
+                print(f"SLOW GENERATION: {elapsed:.1f}s for {len(generated)} tokens ({len(generated)/elapsed:.1f} tok/s)")
+
         return tokenizer.decode(generated)
 
 
@@ -146,6 +196,10 @@ def beam_search_generate(model, src_tokens, tokenizer, device, beam_width=10, ma
     Beam search decoding.
 
     Returns list of (decoded_string, log_probability) tuples, sorted by probability.
+
+    TODO: This implementation is NOT parallelized - each beam does a separate forward pass.
+    For efficiency, should batch all active beams together in a single forward pass.
+    This is non-trivial with KV caching since each beam has different cache states.
     """
     model.eval()
     base_state = constraint.new_state() if constraint else None
@@ -161,6 +215,7 @@ def beam_search_generate(model, src_tokens, tokenizer, device, beam_width=10, ma
 
             candidates = []
 
+            # TODO: Batch these forward passes for efficiency
             for prefix, log_prob, past_kv, finished, state in beams:
                 if finished:
                     candidates.append((prefix, log_prob, past_kv, True, state.copy() if state else None))
@@ -295,7 +350,8 @@ def measure_entropy(model, src_tokens, tokenizer, device, num_steps=10,
 
 def evaluate_on_training_tasks(model, tokenizer, device, num_tasks=400,
                                beam_width=None, measure_entropy_flag=False,
-                               constraint: DSLConstrainedDecoder = None):
+                               constraint: DSLConstrainedDecoder = None,
+                               max_gen_len=2048):
     """Evaluate on synthetic training tasks."""
     dataset = ARCDataset(diff_lb=0.0, diff_ub=0.5)
 
@@ -311,6 +367,7 @@ def evaluate_on_training_tasks(model, tokenizer, device, num_tasks=400,
     task_indices = np.random.choice(len(dataset), size=min(num_tasks, len(dataset)), replace=False)
 
     for idx in tqdm(task_indices, desc="Evaluating training tasks"):
+        task_start = time.time()
         task_id = dataset.tasks[idx]
         generator = getattr(generators, f'generate_{task_id}')
         verifier = getattr(verifiers, f'verify_{task_id}', None)
@@ -360,12 +417,16 @@ def evaluate_on_training_tasks(model, tokenizer, device, num_tasks=400,
             })
 
         # Generate
+        gen_start = time.time()
         if beam_width and beam_width > 1:
             beam_results = beam_search_generate(
                 model, src_tensor, tokenizer, device, beam_width,
-                constraint=constraint
+                max_len=max_gen_len, constraint=constraint
             )
+            gen_time = time.time() - gen_start
+
             # Try each beam candidate
+            exec_start = time.time()
             for generated_code, log_prob in beam_results:
                 syntax_ok, runs_ok, correct = execute_and_score(generated_code, input_grid, output_grid)
                 if correct:
@@ -383,11 +444,21 @@ def evaluate_on_training_tasks(model, tokenizer, device, num_tasks=400,
                 if runs_ok:
                     results['runtime_success'] += 1
                 results['total'] += 1
+            exec_time = time.time() - exec_start
         else:
             generated_code = greedy_generate(
-                model, src_tensor, tokenizer, device, constraint=constraint
+                model, src_tensor, tokenizer, device, max_len=max_gen_len,
+                constraint=constraint, debug=(constraint is not None)
             )
+            gen_time = time.time() - gen_start
+
+            exec_start = time.time()
+            if constraint:
+                print(f"  Executing generated code ({len(generated_code)} chars)...")
             syntax_ok, runs_ok, correct = execute_and_score(generated_code, input_grid, output_grid)
+            exec_time = time.time() - exec_start
+            if constraint and exec_time > 0.5:
+                print(f"  Execution took {exec_time:.2f}s")
 
             if syntax_ok:
                 results['syntax_valid'] += 1
@@ -397,6 +468,10 @@ def evaluate_on_training_tasks(model, tokenizer, device, num_tasks=400,
                 results['correct'] += 1
             results['total'] += 1
 
+        task_time = time.time() - task_start
+        if task_time > 5.0:  # Report slow tasks
+            print(f"\nSLOW TASK {task_id}: {task_time:.1f}s total (gen: {gen_time:.1f}s, exec: {exec_time:.1f}s)")
+
     return results
 
 
@@ -405,7 +480,8 @@ def evaluate_on_eval_tasks(model, tokenizer, device,
                            solutions_path='data/arc-agi_evaluation_solutions.json',
                            num_tasks=None, beam_width=None,
                            measure_entropy_flag=False,
-                           constraint: DSLConstrainedDecoder = None):
+                           constraint: DSLConstrainedDecoder = None,
+                           max_gen_len=2048):
     """Evaluate on real ARC test examples using challenges and solutions files."""
 
     # Load challenges and solutions
@@ -433,6 +509,7 @@ def evaluate_on_eval_tasks(model, tokenizer, device,
         task_ids = task_ids[:min(num_tasks, len(task_ids))]
 
     for task_id in tqdm(task_ids, desc="Evaluating test tasks"):
+        task_start = time.time()
         if task_id not in solutions:
             continue
 
@@ -465,11 +542,15 @@ def evaluate_on_eval_tasks(model, tokenizer, device,
                 })
 
             # Generate
+            gen_start = time.time()
             if beam_width and beam_width > 1:
                 beam_results = beam_search_generate(
                     model, src_tensor, tokenizer, device, beam_width,
-                    constraint=constraint
+                    max_len=max_gen_len, constraint=constraint
                 )
+                gen_time = time.time() - gen_start
+
+                exec_start = time.time()
                 for generated_code, log_prob in beam_results:
                     syntax_ok, runs_ok, correct = execute_and_score(generated_code, input_grid, output_grid)
                     if correct:
@@ -485,12 +566,21 @@ def evaluate_on_eval_tasks(model, tokenizer, device,
                         results['syntax_valid'] += 1
                     if runs_ok:
                         results['runtime_success'] += 1
+                exec_time = time.time() - exec_start
             else:
                 generated_code = greedy_generate(
-                    model, src_tensor, tokenizer, device,
-                    constraint=constraint
+                    model, src_tensor, tokenizer, device, max_len=max_gen_len,
+                    constraint=constraint, debug=(constraint is not None)
                 )
+                gen_time = time.time() - gen_start
+
+                exec_start = time.time()
+                if constraint:
+                    print(f"  Executing generated code ({len(generated_code)} chars)...")
                 syntax_ok, runs_ok, correct = execute_and_score(generated_code, input_grid, output_grid)
+                exec_time = time.time() - exec_start
+                if constraint and exec_time > 0.5:
+                    print(f"  Execution took {exec_time:.2f}s")
 
                 if syntax_ok:
                     results['syntax_valid'] += 1
@@ -501,6 +591,10 @@ def evaluate_on_eval_tasks(model, tokenizer, device,
                     task_solved = True
 
             results['total_examples'] += 1
+
+        task_time = time.time() - task_start
+        if task_time > 5.0:  # Report slow tasks
+            print(f"\nSLOW TASK {task_id}: {task_time:.1f}s total (gen: {gen_time:.1f}s, exec: {exec_time:.1f}s)")
 
         if task_solved:
             results['tasks_solved'] += 1
@@ -597,7 +691,8 @@ def main():
             num_tasks=num_tasks,
             beam_width=args.beam_width,
             measure_entropy_flag=args.measure_entropy,
-            constraint=constraint
+            constraint=constraint,
+            max_gen_len=args.max_gen_len
         )
     else:
         results = evaluate_on_eval_tasks(
@@ -607,7 +702,8 @@ def main():
             num_tasks=args.num_tasks,
             beam_width=args.beam_width,
             measure_entropy_flag=args.measure_entropy,
-            constraint=constraint
+            constraint=constraint,
+            max_gen_len=args.max_gen_len
         )
 
     # Print results
