@@ -243,6 +243,7 @@ def parallel_sample_generate(model, src_tokens, tokenizer, device, num_samples=1
                 print(f"  Step {step}: avg {avg_generated:.1f} tokens generated across {num_samples} samples...")
 
             # Forward pass for all samples in parallel
+            fwd_start = time.time() if debug else None
             if past_key_values is None:
                 seq_len = src_batch.size(1)
                 causal_mask = generate_square_subsequent_mask(seq_len).to(device)
@@ -269,6 +270,11 @@ def parallel_sample_generate(model, src_tokens, tokenizer, device, num_samples=1
                     position_ids=position_ids
                 )
                 step_logits = logits[:, -1, :]  # [num_samples, vocab_size]
+
+            if fwd_start and debug:
+                fwd_time = time.time() - fwd_start
+                if fwd_time > 0.3:
+                    print(f"  WARNING: Forward pass at step {step} took {fwd_time:.2f}s!")
 
             # Apply constraints per sample if needed
             if constraint_states:
@@ -321,8 +327,13 @@ def parallel_sample_generate(model, src_tokens, tokenizer, device, num_samples=1
                         print(f"  WARNING: Top-p filtering at step {step} took {filter_time:.2f}s!")
 
             # Sample from filtered distribution
+            sample_start = time.time() if debug else None
             probs = F.softmax(step_logits, dim=-1)
             next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)  # [num_samples]
+            if sample_start and debug:
+                sample_time = time.time() - sample_start
+                if sample_time > 0.3:
+                    print(f"  WARNING: Sampling (softmax + multinomial) at step {step} took {sample_time:.2f}s!")
 
             # Update generated tokens and states
             for i in range(num_samples):

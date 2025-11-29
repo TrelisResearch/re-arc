@@ -14,29 +14,6 @@
 Last work:
 - Added in guided decoding but score is now down at 2.4$ instead of what was 3.5%. Syntax valid is now 97.4%, which isn't higher than without guidance...
 
-============================================================
-EVALUATION RESULTS (eval mode)
-============================================================
-Total tasks:     400
-Tasks solved:      14 /  400 (3.5%)
-Total examples:  419
-Syntax valid:     409 /  419 (97.6%)
-Runtime success:  295 /  419 (70.4%)
-Correct:           14 /  419 (3.3%)
-============================================================
-
-and with guidance:
-============================================================
-EVALUATION RESULTS (eval mode)
-============================================================
-Total tasks:     400
-Tasks solved:      10 /  400 (2.5%)
-Total examples:  419
-Syntax valid:     408 /  419 (97.4%)
-Runtime success:  279 /  419 (66.6%)
-Correct:           10 /  419 (2.4%)
-============================================================
-
 ## TODO
 - [x] **Review code overall**
     - [x] Review tokenizer
@@ -52,6 +29,17 @@ Correct:           10 /  419 (2.4%)
 - [ ] **Search Strategy**: Implement Beam Search or Temperature Sampling.
 
 ## Performance Notes
+Note that the sampling approach below assumes oracle correctness (which in practise could be checked on the train examples).
+
 20k model on AA1 eval (naive): 3.5%
-+ constrained de-coding: 
-+ beam search: 2.4% (doesn't make a lot of sense)...
++ constrained de-coding + 64 samples: 5.5%
+============================================================
+EVALUATION RESULTS (eval mode)
+============================================================
+Total tasks:     400
+Tasks solved:      23 /  400 (5.8%)
+Total examples:  419
+Syntax valid:     405 /  419 (96.7%)
+Runtime success:  275 /  419 (65.6%)
+Correct:           23 /  419 (5.5%)
+============================================================
