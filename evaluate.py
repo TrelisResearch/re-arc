@@ -6,14 +6,26 @@ Supports two modes:
 2. Evaluation tasks: Evaluate on real ARC test examples from JSON files
 
 Usage:
-    # Evaluate on training tasks
+    # Evaluate on training tasks (greedy decoding)
     uv run evaluate.py --checkpoint checkpoints/model.pt --mode train --num-tasks 50
 
     # Evaluate on evaluation tasks
     uv run evaluate.py --checkpoint checkpoints/model.pt --mode eval
 
-    # Use beam search
-    uv run evaluate.py --checkpoint checkpoints/model.pt --mode eval --beam-width 10
+    # Use parallel sampling (generates N diverse solutions with top-k=50 by default)
+    uv run evaluate.py --checkpoint checkpoints/model.pt --mode eval --num-samples 10 --temperature 0.8
+
+    # Use top-p (nucleus) sampling instead of top-k
+    uv run evaluate.py --checkpoint checkpoints/model.pt --mode eval --num-samples 10 --top-p 0.95 --top-k 0
+
+    # Adjust top-k value
+    uv run evaluate.py --checkpoint checkpoints/model.pt --mode eval --num-samples 10 --top-k 100
+
+    # Use constrained decoding (grammar-aware token masking)
+    uv run evaluate.py --checkpoint checkpoints/model.pt --mode train --constrained-decoding
+
+    # Combine sampling with constraints (uses top-k=50 by default)
+    uv run evaluate.py --checkpoint checkpoints/model.pt --mode eval --num-samples 10 --constrained-decoding
 
     # Measure entropy
     uv run evaluate.py --checkpoint checkpoints/model.pt --mode train --measure-entropy
@@ -190,91 +202,161 @@ def greedy_generate(model, src_tokens, tokenizer, device, max_len=2048,
         return tokenizer.decode(generated)
 
 
-def beam_search_generate(model, src_tokens, tokenizer, device, beam_width=10, max_len=2048,
-                         constraint: DSLConstrainedDecoder = None):
+def parallel_sample_generate(model, src_tokens, tokenizer, device, num_samples=10,
+                            max_len=2048, temperature=0.8, top_k=50, top_p=1.0,
+                            constraint: DSLConstrainedDecoder = None, debug=False):
     """
-    Beam search decoding.
+    Parallel sampling with temperature, top-k, and top-p filtering.
 
-    Returns list of (decoded_string, log_probability) tuples, sorted by probability.
+    Generates num_samples programs in parallel using batched inference.
+    Much more efficient than beam search and provides better diversity.
 
-    TODO: This implementation is NOT parallelized - each beam does a separate forward pass.
-    For efficiency, should batch all active beams together in a single forward pass.
-    This is non-trivial with KV caching since each beam has different cache states.
+    Args:
+        top_k: If > 0, only sample from top k tokens (0 = disabled)
+        top_p: If < 1.0, nucleus sampling - sample from smallest set with cumulative prob >= p
+
+    Returns list of decoded strings (one per sample).
     """
     model.eval()
-    base_state = constraint.new_state() if constraint else None
+    start_time = time.time() if debug else None
 
     with torch.no_grad():
-        # Initialize beam: (prefix_tokens, log_prob, past_kv, finished)
-        src_batch = src_tokens.unsqueeze(0).to(device)
-        beams = [(src_batch, 0.0, None, False, base_state)]
+        # Batch the source tokens - all samples start with same prefix
+        src_batch = src_tokens.unsqueeze(0).repeat(num_samples, 1).to(device)  # [num_samples, seq_len]
+
+        # Each sample gets its own constraint state if using constraints
+        constraint_states = [constraint.new_state() for _ in range(num_samples)] if constraint else None
+
+        past_key_values = None
+        generated = [[] for _ in range(num_samples)]  # Track generated tokens per sample
+        finished = [False] * num_samples
 
         for step in range(max_len):
-            if all(finished for *_, finished in beams):
+            if all(finished):
                 break
 
-            candidates = []
+            step_start = time.time() if debug else None
 
-            # TODO: Batch these forward passes for efficiency
-            for prefix, log_prob, past_kv, finished, state in beams:
-                if finished:
-                    candidates.append((prefix, log_prob, past_kv, True, state.copy() if state else None))
-                    continue
+            # Debug: Print progress every 50 tokens
+            if debug and step > 0 and step % 50 == 0:
+                avg_generated = sum(len(g) for g in generated) / num_samples
+                print(f"  Step {step}: avg {avg_generated:.1f} tokens generated across {num_samples} samples...")
 
-                # Forward pass
-                if past_kv is None:
-                    seq_len = prefix.size(1)
-                    causal_mask = generate_square_subsequent_mask(seq_len).to(device)
-                    padding_mask = (prefix == tokenizer.pad_token_id)
-                    logits, new_kv = model(
-                        prefix,
-                        mask=causal_mask,
-                        padding_mask=padding_mask,
-                        use_cache=True
-                    )
-                else:
-                    past_seq_len = past_kv[0][0].size(2)
-                    position_ids = torch.full(
-                        (1, prefix.size(1)),
-                        past_seq_len,
-                        dtype=torch.long,
-                        device=device
-                    )
-                    logits, new_kv = model(
-                        prefix,
-                        past_key_values=past_kv,
-                        use_cache=True,
-                        position_ids=position_ids
-                    )
+            # Forward pass for all samples in parallel
+            if past_key_values is None:
+                seq_len = src_batch.size(1)
+                causal_mask = generate_square_subsequent_mask(seq_len).to(device)
+                padding_mask = (src_batch == tokenizer.pad_token_id)
+                logits, past_key_values = model(
+                    src_batch,
+                    mask=causal_mask,
+                    padding_mask=padding_mask,
+                    use_cache=True
+                )
+                step_logits = logits[:, -1, :]  # [num_samples, vocab_size]
+            else:
+                past_seq_len = past_key_values[0][0].size(2)
+                position_ids = torch.full(
+                    (num_samples, 1),
+                    past_seq_len,
+                    dtype=torch.long,
+                    device=device
+                )
+                logits, past_key_values = model(
+                    src_batch,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    position_ids=position_ids
+                )
+                step_logits = logits[:, -1, :]  # [num_samples, vocab_size]
 
-                # Get top-K tokens (fixing for beam search too)
-                step_logits = logits[0, -1, :]
-                if constraint and state:
-                    step_logits = constraint.apply(step_logits, state)
-                log_probs = F.log_softmax(step_logits, dim=-1)
-                top_log_probs, top_indices = torch.topk(log_probs, k=beam_width)
+            # Apply constraints per sample if needed
+            if constraint_states:
+                constraint_start = time.time() if debug else None
+                for i in range(num_samples):
+                    if not finished[i]:
+                        step_logits[i] = constraint.apply(step_logits[i].unsqueeze(0), constraint_states[i]).squeeze(0)
+                if constraint_start and debug:
+                    constraint_time = time.time() - constraint_start
+                    if constraint_time > 0.3:
+                        print(f"  WARNING: Constraint application at step {step} took {constraint_time:.2f}s across {sum(1 for f in finished if not f)} active samples!")
 
-                for token_log_prob, token_id in zip(top_log_probs, top_indices):
-                    new_token = token_id.unsqueeze(0).unsqueeze(1)  # [1, 1]
-                    new_prefix = torch.cat([prefix, new_token], dim=1) if past_kv is None else new_token
-                    new_log_prob = log_prob + token_log_prob.item()
-                    is_finished = (token_id.item() == tokenizer.eos_token_id)
-                    new_state = state.copy() if state else None
-                    if new_state and not is_finished:
-                        new_state.update(token_id.item())
+            # Apply temperature
+            step_logits = step_logits / temperature
 
-                    candidates.append((new_prefix, new_log_prob, new_kv, is_finished, new_state))
+            # Top-k filtering
+            if top_k > 0:
+                filter_start = time.time() if debug else None
+                top_k_vals, top_k_indices = torch.topk(step_logits, min(top_k, step_logits.size(-1)), dim=-1)
+                # Set all non-top-k logits to -inf
+                mask = torch.full_like(step_logits, float('-inf'))
+                mask.scatter_(-1, top_k_indices, top_k_vals)
+                step_logits = mask
+                if filter_start and debug:
+                    filter_time = time.time() - filter_start
+                    if filter_time > 0.3:
+                        print(f"  WARNING: Top-k filtering at step {step} took {filter_time:.2f}s!")
 
-            # Keep top beam_width candidates
-            beams = sorted(candidates, key=lambda x: x[1], reverse=True)[:beam_width]
+            # Top-p (nucleus) filtering
+            if top_p < 1.0:
+                filter_start = time.time() if debug else None
+                sorted_logits, sorted_indices = torch.sort(step_logits, descending=True, dim=-1)
+                sorted_probs = F.softmax(sorted_logits, dim=-1)
+                cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
 
-        # Decode all beams
+                # Remove tokens with cumulative probability above the threshold
+                sorted_indices_to_remove = cumulative_probs > top_p
+                # Shift right to keep first token above threshold
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = 0
+
+                # Scatter back to original indexing
+                for i in range(num_samples):
+                    indices_to_remove = sorted_indices[i][sorted_indices_to_remove[i]]
+                    step_logits[i, indices_to_remove] = float('-inf')
+
+                if filter_start and debug:
+                    filter_time = time.time() - filter_start
+                    if filter_time > 0.3:
+                        print(f"  WARNING: Top-p filtering at step {step} took {filter_time:.2f}s!")
+
+            # Sample from filtered distribution
+            probs = F.softmax(step_logits, dim=-1)
+            next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)  # [num_samples]
+
+            # Update generated tokens and states
+            for i in range(num_samples):
+                if not finished[i]:
+                    token_id = next_tokens[i].item()
+
+                    if token_id == tokenizer.eos_token_id:
+                        finished[i] = True
+                    else:
+                        generated[i].append(token_id)
+                        if constraint_states:
+                            constraint_states[i].update(token_id)
+
+            # Prepare next input
+            src_batch = next_tokens.unsqueeze(1)  # [num_samples, 1]
+
+            # Debug: Detect slow steps
+            if step_start and step > 0:
+                step_time = time.time() - step_start
+                if step_time > 0.5:  # Individual step taking >0.5s
+                    avg_context = src_tokens.size(0) + sum(len(g) for g in generated) / num_samples
+                    print(f"  WARNING: Step {step} took {step_time:.2f}s! (avg_context_len={avg_context:.0f})")
+
+        # Decode all samples
         results = []
-        for prefix, log_prob, _, _, _ in beams:
-            # Extract generated tokens (skip source prefix)
-            gen_tokens = prefix[0, src_tokens.size(0):].cpu().tolist()
+        for gen_tokens in generated:
             decoded = tokenizer.decode(gen_tokens)
-            results.append((decoded, log_prob))
+            results.append(decoded)
+
+        if debug and start_time:
+            elapsed = time.time() - start_time
+            avg_tokens = sum(len(g) for g in generated) / num_samples
+            if elapsed > 2.0:  # Only report slow generations
+                print(f"SLOW GENERATION: {elapsed:.1f}s for avg {avg_tokens:.1f} tokens across {num_samples} samples ({avg_tokens*num_samples/elapsed:.1f} tok/s)")
 
         return results
 
@@ -349,7 +431,8 @@ def measure_entropy(model, src_tokens, tokenizer, device, num_steps=10,
 
 
 def evaluate_on_training_tasks(model, tokenizer, device, num_tasks=400,
-                               beam_width=None, measure_entropy_flag=False,
+                               num_samples=None, temperature=0.8, top_k=50, top_p=1.0,
+                               measure_entropy_flag=False,
                                constraint: DSLConstrainedDecoder = None,
                                max_gen_len=2048):
     """Evaluate on synthetic training tasks."""
@@ -418,16 +501,23 @@ def evaluate_on_training_tasks(model, tokenizer, device, num_tasks=400,
 
         # Generate
         gen_start = time.time()
-        if beam_width and beam_width > 1:
-            beam_results = beam_search_generate(
-                model, src_tensor, tokenizer, device, beam_width,
-                max_len=max_gen_len, constraint=constraint
+        if num_samples and num_samples > 1:
+            # Parallel sampling - generate multiple diverse solutions
+            sample_results = parallel_sample_generate(
+                model, src_tensor, tokenizer, device,
+                num_samples=num_samples,
+                max_len=max_gen_len,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                constraint=constraint,
+                debug=True
             )
             gen_time = time.time() - gen_start
 
-            # Try each beam candidate
+            # Try each sample until one succeeds
             exec_start = time.time()
-            for generated_code, log_prob in beam_results:
+            for generated_code in sample_results:
                 syntax_ok, runs_ok, correct = execute_and_score(generated_code, input_grid, output_grid)
                 if correct:
                     results['correct'] += 1
@@ -436,8 +526,8 @@ def evaluate_on_training_tasks(model, tokenizer, device, num_tasks=400,
                     results['total'] += 1
                     break
             else:
-                # No beam succeeded - count best beam's metrics
-                generated_code, _ = beam_results[0]
+                # No sample succeeded - count first sample's metrics
+                generated_code = sample_results[0]
                 syntax_ok, runs_ok, correct = execute_and_score(generated_code, input_grid, output_grid)
                 if syntax_ok:
                     results['syntax_valid'] += 1
@@ -478,7 +568,8 @@ def evaluate_on_training_tasks(model, tokenizer, device, num_tasks=400,
 def evaluate_on_eval_tasks(model, tokenizer, device,
                            challenges_path='data/arc-agi_evaluation_challenges.json',
                            solutions_path='data/arc-agi_evaluation_solutions.json',
-                           num_tasks=None, beam_width=None,
+                           num_tasks=None, num_samples=None, temperature=0.8,
+                           top_k=50, top_p=1.0,
                            measure_entropy_flag=False,
                            constraint: DSLConstrainedDecoder = None,
                            max_gen_len=2048):
@@ -543,15 +634,22 @@ def evaluate_on_eval_tasks(model, tokenizer, device,
 
             # Generate
             gen_start = time.time()
-            if beam_width and beam_width > 1:
-                beam_results = beam_search_generate(
-                    model, src_tensor, tokenizer, device, beam_width,
-                    max_len=max_gen_len, constraint=constraint
+            if num_samples and num_samples > 1:
+                # Parallel sampling - generate multiple diverse solutions
+                sample_results = parallel_sample_generate(
+                    model, src_tensor, tokenizer, device,
+                    num_samples=num_samples,
+                    max_len=max_gen_len,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    constraint=constraint,
+                    debug=True
                 )
                 gen_time = time.time() - gen_start
 
                 exec_start = time.time()
-                for generated_code, log_prob in beam_results:
+                for generated_code in sample_results:
                     syntax_ok, runs_ok, correct = execute_and_score(generated_code, input_grid, output_grid)
                     if correct:
                         results['correct'] += 1
@@ -560,7 +658,8 @@ def evaluate_on_eval_tasks(model, tokenizer, device,
                         task_solved = True
                         break
                 else:
-                    generated_code, _ = beam_results[0]
+                    # No sample succeeded - count first sample's metrics
+                    generated_code = sample_results[0]
                     syntax_ok, runs_ok, correct = execute_and_score(generated_code, input_grid, output_grid)
                     if syntax_ok:
                         results['syntax_valid'] += 1
@@ -662,8 +761,14 @@ def main():
                        help="Path to solutions JSON file (for eval mode)")
     parser.add_argument("--num-tasks", type=int, default=None,
                         help="Limit number of tasks (train defaults to 100; eval uses all)")
-    parser.add_argument("--beam-width", type=int, default=None,
-                       help="Beam width for beam search (default: greedy decoding)")
+    parser.add_argument("--num-samples", type=int, default=None,
+                       help="Number of samples to generate in parallel (default: greedy decoding)")
+    parser.add_argument("--temperature", type=float, default=0.8,
+                       help="Sampling temperature (only used with --num-samples)")
+    parser.add_argument("--top-k", type=int, default=50,
+                       help="Top-k filtering: only sample from top k tokens (default: 50, use 0 to disable)")
+    parser.add_argument("--top-p", type=float, default=1.0,
+                       help="Top-p (nucleus) filtering: sample from smallest set with cumulative prob >= p (default: disabled, use 0.95 for nucleus sampling)")
     parser.add_argument("--measure-entropy", action="store_true",
                        help="Measure model entropy on sample of examples")
     parser.add_argument("--constrained-decoding", action="store_true",
@@ -689,7 +794,10 @@ def main():
         results = evaluate_on_training_tasks(
             model, tokenizer, device,
             num_tasks=num_tasks,
-            beam_width=args.beam_width,
+            num_samples=args.num_samples,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            top_p=args.top_p,
             measure_entropy_flag=args.measure_entropy,
             constraint=constraint,
             max_gen_len=args.max_gen_len
@@ -700,7 +808,10 @@ def main():
             challenges_path=args.challenges,
             solutions_path=args.solutions,
             num_tasks=args.num_tasks,
-            beam_width=args.beam_width,
+            num_samples=args.num_samples,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            top_p=args.top_p,
             measure_entropy_flag=args.measure_entropy,
             constraint=constraint,
             max_gen_len=args.max_gen_len

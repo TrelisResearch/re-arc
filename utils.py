@@ -290,11 +290,28 @@ class DSLConstrainedDecoder:
 
         # Cache for device-local base_allowed to avoid repeated CPU->GPU transfers
         self._base_allowed_cache = {}
+        # Cache for common mask states to avoid expensive rebuild
+        self._mask_cache = {}
 
     def new_state(self) -> DSLConstraintState:
         return DSLConstraintState(config=self)
 
     def build_mask(self, state: DSLConstraintState, device) -> torch.Tensor:
+        # Create cache key from state that determines the mask
+        cache_key = (
+            str(device),
+            state.line_start,
+            state.expect_assign,
+            state.need_value,
+            state.paren_depth,
+            state.last_token_type,
+            state.can_terminate()
+        )
+
+        # Return cached mask if available
+        if cache_key in self._mask_cache:
+            return self._mask_cache[cache_key].clone()
+
         # Use cached device-local tensor to avoid expensive CPU->GPU transfers
         device_key = str(device)
         if device_key not in self._base_allowed_cache:
@@ -369,6 +386,9 @@ class DSLConstrainedDecoder:
             if device_key not in self._base_allowed_cache:
                 self._base_allowed_cache[device_key] = self.base_allowed.to(device)
             mask = self._base_allowed_cache[device_key].clone()
+
+        # Cache the mask for this state
+        self._mask_cache[cache_key] = mask.clone()
 
         return mask
 
