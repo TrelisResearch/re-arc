@@ -11,7 +11,17 @@
     - **% Runtime Success**: Runs without crashing.
     - **% Solved**: Produces exact target grid.
 
+Next up:
+- Check the logic of evluation on test examples...
+- Superposition...
+- Considering the most basic of DSLs...
+
+Ideas:
+- What is a simple approach to guess + vary? What kind of dsl is needed to make this possible? What is the most rudimentary of dsls to boostrap from here?
+- Could superposition and training on super positions of example pairs somehow help? What if I just try to inference on a superposition? what does that predict?
+
 Last work:
+- The neural net approach does worse than using training dataset verifiers. Seems reasonable. DOUBLE CHECK THE LOGIC OF HOW THIS COULD WORK.
 - Added in guided decoding but score is now down at 2.4$ instead of what was 3.5%. Syntax valid is now 97.4%, which isn't higher than without guidance...
 
 ## TODO
